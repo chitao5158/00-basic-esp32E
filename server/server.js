@@ -1,5 +1,5 @@
 /**
- * ESP32 盆栽监控后端 — Node.js + Express + MariaDB
+ * ESP32 盆栽监控后端 — Node.js + Express + MariaDB (CommonJS)
  *
  * 路由:
  *   POST /api/ingest    接收 ESP32 上报数据
@@ -8,31 +8,30 @@
  *   GET  /plant/        静态前端 (Chart.js)
  *
  * 部署: Hostinger Cloud Web Apps (Node.js 18+) 或任何支持 Node 的平台
+ *
+ * 使用 CommonJS (require/module.exports) 而非 ESM, 兼容性更好.
  */
 
-import express from 'express';
-import mysql from 'mysql2/promise';
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
+const express = require('express');
+const mysql   = require('mysql2/promise');
+const dotenv  = require('dotenv');
+const path    = require('path');
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 
 /* ---------- 中间件 ---------- */
 app.use(express.json({ limit: '4kb' }));
+app.set('trust proxy', 1);  // Hostinger nginx 在前面
 
-// 让 express 信任 1 层代理 (Hostinger nginx 在前面)
-app.set('trust proxy', 1);
+// 立即往 stderr 打一行, 证明进程真的启动了 (很多平台只捕获 stderr)
+process.stderr.write(`[boot] starting, NODE_ENV=${process.env.NODE_ENV || 'unset'}\n`);
 
 /* ---------- 静态前端 (/plant/) ---------- */
 app.use('/plant', express.static(path.join(__dirname, 'public')));
 
-// 兼容直接访问 /plant/ 时返回 index.html
+// 兼容 /plant/ 直接访问
 app.get('/plant', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -52,10 +51,10 @@ const pool = mysql.createPool({
 
 /* ---------- 鉴权辅助 ---------- */
 function checkApiKey(req) {
-    const provided = req.body?.key
-                   ?? req.query?.key
-                   ?? req.headers['x-api-key']
-                   ?? '';
+    const provided = (req.body && req.body.key)
+                  || (req.query && req.query.key)
+                  || req.headers['x-api-key']
+                  || '';
     return typeof provided === 'string'
         && provided.length > 0
         && provided === process.env.API_KEY;
@@ -67,11 +66,11 @@ app.post('/api/ingest', async (req, res) => {
         return res.status(401).json({ ok: false, error: 'invalid API key' });
     }
 
-    const device_id  = (req.body?.device_id || '').toString().trim();
-    const adc        = parseInt(req.body?.adc);
-    const pct        = parseInt(req.body?.pct);
-    const pump_raw   = (req.body?.pump || '').toString().toUpperCase().trim();
-    const sensor_err = req.body?.sensor_err ? 1 : 0;
+    const device_id  = (req.body && req.body.device_id || '').toString().trim();
+    const adc        = parseInt(req.body && req.body.adc);
+    const pct        = parseInt(req.body && req.body.pct);
+    const pump_raw   = (req.body && req.body.pump || '').toString().toUpperCase().trim();
+    const sensor_err = (req.body && req.body.sensor_err) ? 1 : 0;
 
     if (!device_id || device_id.length > 64) {
         return res.status(400).json({ ok: false, error: 'invalid device_id' });
@@ -91,7 +90,6 @@ app.post('/api/ingest', async (req, res) => {
             [device_id, adc, pct, pump_state, sensor_err]
         );
 
-        // 更新 devices.last_seen (如果设备已注册)
         await pool.execute(
             `UPDATE devices SET last_seen = NOW() WHERE device_id = ?`,
             [device_id]
@@ -100,7 +98,7 @@ app.post('/api/ingest', async (req, res) => {
         console.log(`[ingest] device=${device_id} adc=${adc} pct=${pct} pump=${pump_state} id=${result.insertId}`);
         return res.json({ ok: true, id: result.insertId, ts: new Date().toISOString() });
     } catch (err) {
-        console.error('[ingest] DB error:', err);
+        process.stderr.write(`[ingest] DB error: ${err.message}\n`);
         return res.status(500).json({ ok: false, error: 'db error' });
     }
 });
@@ -113,10 +111,7 @@ app.get('/api/data', async (req, res) => {
              FROM soil_readings ORDER BY id DESC LIMIT 1`
         );
         const latest = latestRows[0] || null;
-        if (latest) {
-            // mysql2 datetime 转 ISO 字符串
-            latest.ts = new Date(latest.ts).toISOString();
-        }
+        if (latest) latest.ts = new Date(latest.ts).toISOString();
 
         const [historyRows] = await pool.execute(
             `SELECT ts, pct, pump_state
@@ -132,21 +127,25 @@ app.get('/api/data', async (req, res) => {
         return res.json({
             latest,
             history: historyRows.map(r => ({
-                ts: new Date(r.ts).toISOString(),
-                pct: r.pct,
+                ts:   new Date(r.ts).toISOString(),
+                pct:  r.pct,
                 pump: r.pump_state,
             })),
             total_readings: totalRows[0].c,
         });
     } catch (err) {
-        console.error('[data] DB error:', err);
+        process.stderr.write(`[data] DB error: ${err.message}\n`);
         return res.status(500).json({ error: 'db error' });
     }
 });
 
 /* ---------- GET /api/health ---------- */
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, ts: new Date().toISOString(), uptime: process.uptime() });
+    res.json({
+        ok: true,
+        ts: new Date().toISOString(),
+        uptime: process.uptime(),
+    });
 });
 
 /* ---------- 404 fallback ---------- */
@@ -156,5 +155,6 @@ app.use((req, res) => {
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[plant-monitor] listening on 0.0.0.0:${PORT}`);
+    process.stderr.write(`[boot] listening on 0.0.0.0:${PORT} (cwd=${process.cwd()})\n`);
+    console.log(`[plant-monitor] listening on port ${PORT}`);
 });

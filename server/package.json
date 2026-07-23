@@ -1,8 +1,7 @@
 {
   "name": "plant-monitor-backend",
-  "version": "1.0.0",
-  "description": "ESP32 soil moisture monitor backend (Express + MariaDB)",
-  "type": "module",
+  "version": "1.1.0",
+  "description": "ESP32 soil moisture monitor backend (Express + MariaDB, CommonJS)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
