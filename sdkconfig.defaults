@@ -1,0 +1,26 @@
+# ==============================================================
+# 绿深 ESP32-E 开发板  (module: ESP32-WROOM-32E, 4MB flash)
+# TYPE-C 接口, 板载 CH340C, 支持自动下载
+# Persistent project defaults. `sdkconfig` is auto-generated and
+# will be recreated from these values on set-target / reconfigure.
+# ==============================================================
+
+# --- Target chip ---
+CONFIG_IDF_TARGET="esp32"
+
+# --- ESP32-D0WD-V3 silicon used on WROOM-32E ---
+CONFIG_ESP32_REV_MIN_3=y
+
+# --- SPI flash (WROOM-32E: DIO, 80MHz, 4MB) ---
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- Custom 4MB partition table ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4Mib.csv"
+
+# --- Console over USB-UART bridge (CH340C) on UART0 @115200 ---
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
