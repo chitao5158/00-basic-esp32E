@@ -1,0 +1,10 @@
+# 阻止外部直接访问 config.php (含 DB 密码 + API Key)
+<FilesMatch "config\.php$">
+    Require all denied
+</FilesMatch>
+
+# 安全头
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "DENY"
+</IfModule>

@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>afl.cn · 盆栽监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+            background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+            min-height: 100vh;
+            color: #1b3a1b;
+            padding: 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        header { text-align: center; padding: 30px 0; }
+        header h1 { font-size: 32px; margin-bottom: 8px; }
+        header .subtitle { font-size: 14px; opacity: 0.7; }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .card .label { font-size: 13px; opacity: 0.6; margin-bottom: 8px; }
+        .card .value { font-size: 32px; font-weight: 600; }
+        .card .value.pump-on   { color: #1976d2; }
+        .card .value.pump-off  { color: #757575; }
+        .card .value.pump-lock { color: #d32f2f; }
+        .card.sensor-err { background: #ffebee; border: 2px solid #d32f2f; }
+
+        .chart-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 24px;
+        }
+        .chart-card h2 { font-size: 18px; margin-bottom: 16px; }
+        .chart-container { position: relative; height: 320px; }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            opacity: 0.6;
+        }
+
+        .bar-container {
+            margin-top: 12px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            height: 12px;
+            overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #66bb6a, #43a047);
+            transition: width 0.5s;
+        }
+
+        .footer {
+            text-align: center;
+            font-size: 12px;
+            opacity: 0.5;
+            margin-top: 30px;
+            padding-bottom: 20px;
+        }
+
+        @media (max-width: 600px) {
+            body { padding: 12px; }
+            header h1 { font-size: 24px; }
+            .card .value { font-size: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌱 盆栽实时监控</h1>
+            <div class="subtitle">afl.cn · 每 30 秒自动刷新</div>
+        </header>
+
+        <div id="content">加载中...</div>
+
+        <div class="footer">
+            数据来源: ESP32 (每 5 分钟上报) · 前端每 30 秒刷新
+        </div>
+    </div>
+
+    <script>
+        const PUMP_LABEL = { ON: '运行中', OFF: '已停止', LOCKED: '已锁定' };
+        let chart = null;
+
+        async function fetchData() {
+            try {
+                const r = await fetch('/api/data', { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return await r.json();
+            } catch (err) {
+                document.getElementById('content').innerHTML =
+                    `<div class="card sensor-err">
+                        <div class="label">⚠️ 后端无响应</div>
+                        <div class="value" style="font-size:16px;">${err.message}</div>
+                    </div>`;
+                return null;
+            }
+        }
+
+        function renderStatus(latest) {
+            if (!latest) {
+                return `<div class="card"><div class="empty-state">
+                    <p>📡 暂无数据</p>
+                    <p style="margin-top:8px;font-size:13px;">ESP32 还没上报过数据</p>
+                </div></div>`;
+            }
+            const isErr = Number(latest.sensor_err) === 1;
+            const pumpClass = isErr ? 'pump-lock' :
+                              latest.pump_state === 'ON' ? 'pump-on' : 'pump-off';
+            const pumpCN = PUMP_LABEL[latest.pump_state] || latest.pump_state;
+
+            return `<div class="status-grid">
+                <div class="card${isErr ? ' sensor-err' : ''}">
+                    <div class="label">土壤湿度</div>
+                    <div class="value">${latest.pct}%</div>
+                    <div class="bar-container">
+                        <div class="bar-fill" style="width:${latest.pct}%"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="label">水泵状态</div>
+                    <div class="value ${pumpClass}">${pumpCN}</div>
+                </div>
+                <div class="card">
+                    <div class="label">设备</div>
+                    <div class="value" style="font-size:18px;">${latest.device_id}</div>
+                </div>
+                <div class="card">
+                    <div class="label">原始 ADC</div>
+                    <div class="value">${latest.adc}</div>
+                </div>
+            </div>`;
+        }
+
+        function renderChart(history) {
+            if (!history || history.length === 0) {
+                return `<div class="chart-card"><h2>📈 最近 24 小时土壤湿度</h2>
+                    <div class="empty-state">暂无历史数据</div></div>`;
+            }
+            const labels = history.map(h => {
+                const d = new Date(h.ts);
+                return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            });
+            const pcts  = history.map(h => h.pct);
+            const pumps = history.map(h => h.pump === 'ON' ? 1 : 0);
+
+            return `<div class="chart-card">
+                <h2>📈 最近 24 小时土壤湿度</h2>
+                <div class="chart-container"><canvas id="chart"></canvas></div>
+            </div>
+            <script>
+                const ctx = document.getElementById('chart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: ${JSON.stringify(labels)},
+                        datasets: [{
+                            label: '湿度 %',
+                            data: ${JSON.stringify(pcts)},
+                            borderColor: 'rgb(67, 160, 71)',
+                            backgroundColor: 'rgba(67, 160, 71, 0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 2,
+                            pointHoverRadius: 5,
+                        }, {
+                            label: '水泵 (1=ON)',
+                            data: ${JSON.stringify(pumps)},
+                            borderColor: 'rgb(25, 118, 210)',
+                            borderDash: [4, 4],
+                            tension: 0,
+                            pointRadius: 0,
+                            yAxisID: 'y1',
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: { legend: { position: 'bottom' } },
+                        scales: {
+                            x: { ticks: { maxTicksLimit: 12 } },
+                            y:  { min: 0, max: 100, title: { display: true, text: '湿度 %' } },
+                            y1: { min: 0, max: 1, display: false }
+                        }
+                    }
+                });
+            <\/script>`;
+        }
+
+        async function refresh() {
+            const data = await fetchData();
+            if (!data) return;
+
+            const html = renderStatus(data.latest) + renderChart(data.history) +
+                `<div class="chart-card" style="font-size:13px;opacity:0.8;">
+                    <strong>📊 总览</strong> &nbsp;
+                    总采样: <strong>${data.total_readings}</strong> 条 &nbsp;·&nbsp;
+                    最近上报: <strong>${data.latest ? new Date(data.latest.ts).toLocaleString('zh-CN') : '无'}</strong>
+                </div>`;
+
+            document.getElementById('content').innerHTML = html;
+
+            // 若上面注入的 <script> 还没执行, 等 DOM 解析后再 new Chart
+            if (data.history && data.history.length > 0) {
+                // 由于 innerHTML 注入的 script 标签会在解析时执行, 但 Chart.js 需要 canvas 已存在
+                // 重新执行一次以确保 chart 创建
+                setTimeout(() => {
+                    const canvas = document.getElementById('chart');
+                    if (canvas && !canvas.chart) {
+                        const labels = data.history.map(h => {
+                            const d = new Date(h.ts);
+                            return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+                        });
+                        const pcts  = data.history.map(h => h.pct);
+                        const pumps = data.history.map(h => h.pump === 'ON' ? 1 : 0);
+                        new Chart(canvas.getContext('2d'), {
+                            type: 'line',
+                            data: {
+                                labels: labels,
+                                datasets: [{
+                                    label: '湿度 %',
+                                    data: pcts,
+                                    borderColor: 'rgb(67, 160, 71)',
+                                    backgroundColor: 'rgba(67, 160, 71, 0.15)',
+                                    fill: true,
+                                    tension: 0.3,
+                                }, {
+                                    label: '水泵 (1=ON)',
+                                    data: pumps,
+                                    borderColor: 'rgb(25, 118, 210)',
+                                    borderDash: [4, 4],
+                                    yAxisID: 'y1',
+                                }]
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                interaction: { mode: 'index', intersect: false },
+                                plugins: { legend: { position: 'bottom' } },
+                                scales: {
+                                    y:  { min: 0, max: 100 },
+                                    y1: { min: 0, max: 1, display: false }
+                                }
+                            }
+                        });
+                    }
+                }, 100);
+            }
+        }
+
+        refresh();
+        setInterval(refresh, 30000);  // 每 30 秒刷新
+    </script>
+</body>
+</html>
