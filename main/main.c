@@ -38,6 +38,7 @@
 #include "driver/gpio.h"
 
 #include "ssd1306.h"
+#include "remote.h"
 
 static const char *TAG = "app";
 
@@ -62,6 +63,7 @@ static const char *TAG = "app";
 #define PUMP_ON_PCT         30      /* 低于此值启泵 */
 #define PUMP_OFF_PCT        70      /* 高于此值关泵 */
 #define SAMPLE_PERIOD_MS    2000    /* 采样周期 */
+#define PUSH_PERIOD_MS      300000  /* 远程推送周期 (5 分钟) */
 
 /* ==== 安全机制 (防止传感器故障 / 接线松脱导致水泵一直开) ==== */
 #define PUMP_MAX_RUNTIME_MS 60000   /* 水泵最长连续运行 60s 后强制关闭 */
@@ -243,13 +245,14 @@ static void render(int adc, int pct)
     line_bar[BAR_LEN] = '\0';
 
     snprintf(line_pump, sizeof(line_pump), "Pump: %s", s_pump_on ? "ON " : "OFF");
-    snprintf(line_dbg,  sizeof(line_dbg),  "ADC: %4d", adc);
+    snprintf(line_dbg,  sizeof(line_dbg),  "ADC:%4d W:%s",
+             adc, remote_is_connected() ? "OK" : "-- ");
 
     ssd1306_clear();
     ssd1306_draw_string(0,  0, line_pct);   /* 土壤湿度 %  */
     ssd1306_draw_string(0,  8, line_bar);   /* 进度条      */
     ssd1306_draw_string(0, 16, line_pump);  /* 水泵状态    */
-    ssd1306_draw_string(0, 24, line_dbg);   /* 原始 ADC 值 */
+    ssd1306_draw_string(0, 24, line_dbg);   /* 原始 ADC + WiFi 状态 */
     ssd1306_refresh();
 }
 
@@ -276,13 +279,27 @@ void app_main(void)
     ESP_LOGI(TAG, "自动浇花已启动: pct<%d -> 启泵, pct>=%d -> 关泵",
              PUMP_ON_PCT, PUMP_OFF_PCT);
 
+    /* 远程推送初始化 (WiFi + HTTP 客户端). 失败也不阻塞本地. */
+    remote_init();
+    ESP_LOGI(TAG, "远程推送目标: %s (推送周期 %d ms)", INGEST_URL, PUSH_PERIOD_MS);
+
+    TickType_t last_push_tick = 0;
+
     while (true) {
         int adc = soil_adc_read_avg();
         int pct = soil_pct(adc);
-        control_pump(adc, pct);    /* hysteresis + 安全检查, 仅在跨阈值时翻转 */
+        control_pump(adc, pct);    /* hysteresis + 安全检查 */
         ESP_LOGI(TAG, "soil: adc=%4d  pct=%3d%%  pump=%s",
                  adc, pct, s_pump_on ? "ON " : "OFF");
         render(adc, pct);
+
+        /* 周期性推送到云端 (默认 5 分钟一次) */
+        TickType_t now = xTaskGetTickCount();
+        if (now - last_push_tick >= pdMS_TO_TICKS(PUSH_PERIOD_MS)) {
+            last_push_tick = now;
+            remote_post_reading(adc, pct, s_pump_on ? "ON" : "OFF", s_sensor_err);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }

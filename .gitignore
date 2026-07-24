@@ -32,6 +32,9 @@ flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
 
+# PHP backend: 真实凭据 (config.example.php 提交, config.php 不提交)
+api/config.php
+
 # ESP-IDF dependencies
 # For older versions or manual component management
 /components/.idf/

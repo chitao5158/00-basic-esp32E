@@ -1,15 +1,19 @@
 /**
  * @file remote.c
- * @brief WiFi 连接 + HTTP POST 推送土壤湿度到 afl.cn
+ * @brief WiFi 连接 + HTTPS POST 推送土壤湿度到 afl.cn
+ *
+ * TLS 验证: 使用 ESP-IDF 内置 CA bundle (mbedtls/esp_crt_bundle)
+ *   通过 menuconfig 启用 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+ *   默认 full 模式包含 Let's Encrypt 全部 CA, 验证 afl.cn 自动通过.
  *
  * ⚠️ 首次使用必须在下面 USER CONFIG 区域填入:
  *   1. WIFI_SSID / WIFI_PASS    你的 WiFi 名字 + 密码
- *   2. DEVICE_API_KEY           必须与 afl.cn/api/config.php 的 API_KEY 完全一致
+ *   2. DEVICE_API_KEY           必须与 Supabase/后端 API_KEY 一致
  *
  * 设计:
  *   - WiFi 失败不阻塞本地自动浇水 (远程是辅助, 本地是核心)
  *   - HTTP 推送失败仅打 E 级别日志, 下次循环重试
- *   - 5 分钟一次 POST (由 main.c 控制)
+ *   - 推送周期由 main.c 控制
  */
 
 #include "remote.h"
@@ -23,6 +27,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
@@ -31,9 +36,9 @@ static const char *TAG = "remote";
 /* ============================================================
  *  USER CONFIG — 填你自己的值, 然后重新编译烧录
  * ============================================================ */
-#define WIFI_SSID         "MERCURY_19F9"          /* ← 改成你 WiFi 的名字 */
-#define WIFI_PASS         "abc@1234567"      /* ← 改成你 WiFi 的密码 */
-#define DEVICE_API_KEY    "05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3"    /* ← 必须与 afl.cn/api/config.php 中 API_KEY 一致 */
+#define WIFI_SSID         "MERCURY_19F9"          /* ← 你的 WiFi 名字 */
+#define WIFI_PASS         "abc@1234567"           /* ← 你的 WiFi 密码 */
+#define DEVICE_API_KEY    "05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3"
 
 /* WiFi 连接超时 (ms) */
 #define WIFI_TIMEOUT_MS   30000
@@ -93,7 +98,7 @@ esp_err_t remote_init(void)
     strncpy((char *)wifi_config.sta.ssid,     WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;  /* 兼容 WPA2/WPA3 */
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -109,7 +114,7 @@ esp_err_t remote_init(void)
         ESP_LOGW(TAG, "WiFi 连接超时 (%d ms), 远程推送将不可用, 本地浇水照常工作",
                  WIFI_TIMEOUT_MS);
     }
-    return ESP_OK;  /* 即使超时也返回 OK, 不阻塞本地逻辑 */
+    return ESP_OK;
 }
 
 esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sensor_err)
@@ -131,11 +136,13 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
         return ESP_FAIL;
     }
 
+    /* HTTPS + 内置 CA bundle 验证 (Let's Encrypt 自动信任) */
     esp_http_client_config_t config = {
-        .url           = INGEST_URL,
-        .method        = HTTP_METHOD_POST,
-        .timeout_ms    = HTTP_TIMEOUT_MS,
-        .transport_type = HTTP_TRANSPORT_OVER_TCP,  /* HTTP, 不走 TLS */
+        .url              = INGEST_URL,
+        .method           = HTTP_METHOD_POST,
+        .timeout_ms       = HTTP_TIMEOUT_MS,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {

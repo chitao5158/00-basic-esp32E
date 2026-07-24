@@ -238,3 +238,59 @@ E (...) app: 水泵已连续运行 60000 ms (上限 60000 ms), 强制关闭
 | 继电器没有「咔哒」声 | VCC 没接 5V / IN 没接 P5。万用表量模块 VCC-GND 应有 ~5V |
 | 烧录 `chip stopped responding` | 关闭串口监视器；降波特率 `-b 115200`；必要时按住 BOOT 键再烧 |
 | 构建报 `driver/gpio.h: No such file or directory` | ESP-IDF v6 把 `driver/*.h` 拆成 `esp_driver_*` 组件。在 `main/CMakeLists.txt` 的 REQUIRES 加 `esp_driver_gpio` |
+---
+
+## 远程监控子系统 (新增)
+
+ESP32 通过 WiFi + HTTPS 把读数推到 `afl.cn/plant/`，任何浏览器都能看实时数据。
+
+### 架构
+
+```
+[ESP32]  --WiFi/HTTPS-->  [Hostinger Web App]  --pg-->  [Supabase Postgres]
+   土壤传感器             Node.js Express           afl.cn/api/ingest
+   继电器+OLED            后端服务 (server.js)      afl.cn/plant/ (前端)
+```
+
+### 关键文件
+
+| 文件 | 作用 |
+|---|---|
+| `main/remote.c` | WiFi 连接 + HTTPS POST（包含 USER CONFIG 区域填 WiFi 凭据和 API key） |
+| `main/remote.h` | remote 模块的公开 API |
+| `server/server.js` | Node.js + Express 后端，监听 `/api/ingest` 和 `/api/data` |
+| `server/public/index.html` | `afl.cn/plant/` 前端（Chart.js 折线图） |
+| `server/.env.example` | 后端环境变量模板 |
+| `sql/schema.sql` | Supabase Postgres 表结构 |
+
+### 部署
+
+**Supabase 端**：
+1. 注册 supabase.com → 创建项目
+2. SQL Editor 跑 `sql/schema.sql`
+3. Project Settings → Database → Connection string (Transaction pooler)
+
+**Hostinger 端**：
+1. hPanel → Web Apps → 从 GitHub 部署 `server/` 子目录
+2. 设环境变量：`DATABASE_URL` + `API_KEY`（与 ESP32 的 `DEVICE_API_KEY` 一致）
+3. 自动 redeploy
+
+**ESP32 端**：
+1. `main/remote.c` USER CONFIG 填：
+   - `WIFI_SSID` / `WIFI_PASS`
+   - `DEVICE_API_KEY`（与后端 `API_KEY` 一致）
+2. `sdkconfig.defaults` 启用 `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y`（验证 Let's Encrypt）
+3. 编译烧录
+
+### 推送周期
+
+默认 5 分钟（`PUSH_PERIOD_MS = 300000`），可调。
+
+### 调试常见问题
+
+| 现象 | 处理 |
+|---|---|
+| ESP32 串口 `esp-tls-mbedtls: No server verification option` | 启用 `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y` |
+| ESP32 串口 `mbedtls_x509_crt_parse returned -0x002C` | 硬编码证书格式问题，改用 mbedTLS bundle |
+| 浏览器 `afl.cn/plant/` 空白 | 检查 Supabase 表是否存在 + `SHOW TABLES` |
+| 推送 5xx | 看 Hostinger Runtime logs 找 `[ingest] DB error` |

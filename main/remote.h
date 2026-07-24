@@ -1,6 +1,6 @@
 /**
  * @file remote.h
- * @brief WiFi 连接 + HTTP POST 上报到 afl.cn/api/ingest.php
+ * @brief WiFi 连接 + HTTPS POST 上报到 afl.cn/api/ingest
  */
 #pragma once
 
@@ -10,7 +10,7 @@
 /* ==== 用户配置 (按需修改, 烧一次固件即可生效) ==== */
 /* 这些值在 remote.c 里定义, 修改后重新编译烧录 */
 #define DEVICE_ID        "esp32_jh_01"                        /* 设备唯一 ID */
-#define INGEST_URL       "http://afl.cn/api/ingest.php"       /* 后端 POST 地址 */
+#define INGEST_URL       "https://afl.cn/api/ingest"          /* 后端 POST 地址 (HTTPS, 无 .php) */
 
 /* ==== API ==== */
 
