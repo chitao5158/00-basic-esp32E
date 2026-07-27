@@ -112,7 +112,7 @@ app.post('/api/ingest', async (req, res) => {
                     payload: cmdResult.rows[0].payload ? JSON.parse(cmdResult.rows[0].payload) : null,
                 };
             }
-        } catch (e) { /* commands 表可能没建, 忽略 */ }
+        } catch (e) { process.stderr.write(`[ingest] cmd query: ${e.message}\n`); }
 
         console.log(`[ingest] device=${device_id} adc=${adc} pct=${pct} pump=${pump_state} id=${insert_id} cmd=${cmd ? cmd.name + '#' + cmd.id : 'none'}`);
         return res.json({
@@ -148,6 +148,43 @@ app.post('/api/command', async (req, res) => {
         return res.json({ ok: true, id: r.rows[0].id, cmd, device_id, ts: new Date().toISOString() });
     } catch (err) {
         process.stderr.write(`[command] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
+/* ---------- GET /api/cmd (ESP32 主动拉取待执行命令) ---------- */
+/* 替代不可靠的 POST 响应 piggyback — ESP-IDF v6 的 esp_http_client
+   对 POST 响应 body 读取有 bug, 改用独立 GET 保证命令一定能送达 */
+app.get('/api/cmd', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const device_id = (req.query && req.query.device_id || '').toString().trim();
+    if (!device_id || device_id.length > 64) {
+        return res.status(400).json({ ok: false, error: 'invalid device_id' });
+    }
+
+    try {
+        const cmdResult = await pool.query(
+            `SELECT id, cmd, payload FROM commands
+             WHERE device_id = $1 AND status = 'pending'
+             ORDER BY id ASC LIMIT 1`,
+            [device_id]
+        );
+        const cmd = cmdResult.rows[0]
+            ? {
+                id: Number(cmdResult.rows[0].id),
+                name: cmdResult.rows[0].cmd,
+                payload: cmdResult.rows[0].payload
+                    ? (typeof cmdResult.rows[0].payload === 'string'
+                        ? JSON.parse(cmdResult.rows[0].payload)
+                        : cmdResult.rows[0].payload)
+                    : null,
+              }
+            : null;
+        return res.json({ ok: true, cmd });
+    } catch (err) {
+        process.stderr.write(`[cmd] DB error: ${err.message}\n`);
         return res.status(500).json({ ok: false, error: 'db error' });
     }
 });
