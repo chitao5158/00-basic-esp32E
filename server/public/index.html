@@ -75,6 +75,40 @@
             padding-bottom: 20px;
         }
 
+        .control-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 24px;
+        }
+        .control-card h2 { font-size: 18px; margin-bottom: 12px; }
+        .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+        .btn {
+            padding: 12px 20px;
+            font-size: 15px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: transform 0.1s, opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn:active { transform: scale(0.97); }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-water { background: #1976d2; color: white; }
+        .btn-stop  { background: #d32f2f; color: white; }
+        .btn-cal   { background: #757575; color: white; }
+        .btn-reb   { background: #f57c00; color: white; }
+        .control-status {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #555;
+            min-height: 18px;
+        }
+        .control-status.ok  { color: #2e7d32; }
+        .control-status.err { color: #c62828; }
+
         @media (max-width: 600px) {
             body { padding: 12px; }
             header h1 { font-size: 24px; }
@@ -91,6 +125,20 @@
 
         <div id="content">加载中...</div>
 
+        <div class="control-card">
+            <h2>🎮 远程控制</h2>
+            <div class="btn-row">
+                <button class="btn btn-water" onclick="sendCmd('WATER', {sec: 5})">💧 浇水 5 秒</button>
+                <button class="btn btn-water" onclick="sendCmd('WATER', {sec: 15})">💧 浇水 15 秒</button>
+                <button class="btn btn-stop"  onclick="sendCmd('STOP', null)">⛔ 立即停泵</button>
+                <button class="btn btn-reb"   onclick="sendCmd('REBOOT', null)">🔄 重启 ESP32</button>
+            </div>
+            <div id="ctrl-status" class="control-status"></div>
+            <div style="font-size:11px; opacity:0.6; margin-top:8px;">
+                ⏱ 命令会在 ESP32 下次上报数据时执行 (默认 5 分钟)
+            </div>
+        </div>
+
         <div class="footer">
             数据来源: ESP32 (每 5 分钟上报) · 前端每 30 秒刷新
         </div>
@@ -98,7 +146,31 @@
 
     <script>
         const PUMP_LABEL = { ON: '运行中', OFF: '已停止', LOCKED: '已锁定' };
+        const API_KEY = prompt('输入 API_KEY (一次性, 保存在浏览器)', '05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3') || '05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3';
         let chart = null;
+
+        async function sendCmd(cmd, payload) {
+            const el = document.getElementById('ctrl-status');
+            el.className = 'control-status';
+            el.textContent = `⏳ 发送 ${cmd}...`;
+            document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+            try {
+                const r = await fetch('/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: API_KEY, cmd, payload })
+                });
+                const data = await r.json();
+                if (!r.ok || !data.ok) throw new Error(data.error || 'HTTP ' + r.status);
+                el.className = 'control-status ok';
+                el.textContent = `✅ 命令已入队 (#${data.id}, ${cmd}) — ESP32 下次上报时执行`;
+            } catch (err) {
+                el.className = 'control-status err';
+                el.textContent = `❌ 失败: ${err.message}`;
+            } finally {
+                document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+            }
+        }
 
         async function fetchData() {
             try {
