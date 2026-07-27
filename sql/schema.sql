@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS devices (
     active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- 第 3 条: 远程控制命令队列 (ESP32 上报后 GET /api/cmd 拉取, 执行完 ACK)
+CREATE TABLE IF NOT EXISTS commands (
+    id BIGSERIAL PRIMARY KEY,
+    device_id VARCHAR(64) NOT NULL,
+    cmd VARCHAR(32) NOT NULL,
+    payload JSONB,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    acked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_cmd_device_status ON commands (device_id, status);
+
 -- ==============================================================
 -- 验证用:
 -- SELECT tablename FROM pg_tables WHERE schemaname='public';

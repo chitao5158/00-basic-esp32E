@@ -28,3 +28,7 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # --- TLS: 内置 CA bundle (验证 Let's Encrypt 证书签发 afl.cn) ---
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# --- Main task 栈: app_main 里要初始化 WiFi + 跑带 printf/I2C 的循环 ---
+# ESP-IDF v6 默认 16384, 之前继承到了 3584 导致 stack overflow
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384

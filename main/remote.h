@@ -14,6 +14,7 @@ void relay_write(bool on);
 /* 这些值在 remote.c 里定义, 修改后重新编译烧录 */
 #define DEVICE_ID        "esp32_jh_01"                        /* 设备唯一 ID */
 #define INGEST_URL       "https://afl.cn/api/ingest"          /* 后端 POST 地址 (HTTPS, 无 .php) */
+#define CMD_POLL_URL     "https://afl.cn/api/cmd"             /* 后端 GET 地址: 拉取待执行命令 */
 
 /* ==== API ==== */
 

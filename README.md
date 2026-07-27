@@ -238,6 +238,7 @@ E (...) app: 水泵已连续运行 60000 ms (上限 60000 ms), 强制关闭
 | 继电器没有「咔哒」声 | VCC 没接 5V / IN 没接 P5。万用表量模块 VCC-GND 应有 ~5V |
 | 烧录 `chip stopped responding` | 关闭串口监视器；降波特率 `-b 115200`；必要时按住 BOOT 键再烧 |
 | 构建报 `driver/gpio.h: No such file or directory` | ESP-IDF v6 把 `driver/*.h` 拆成 `esp_driver_*` 组件。在 `main/CMakeLists.txt` 的 REQUIRES 加 `esp_driver_gpio` |
+| 运行 ~10 秒后 `stack overflow in task main`, 死循环前几次看起来正常 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE` 被老项目继承到了 3584。`app_main` 里同时跑 WiFi 初始化 + 带 `ESP_LOGI` 的循环, 3.5KB 栈不够。在 `sdkconfig.defaults` 改成 `16384`, 删除 `sdkconfig` 后 `idf.py reconfigure` |
 ---
 
 ## 远程监控子系统 (新增)

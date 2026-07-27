@@ -117,6 +117,10 @@ esp_err_t remote_init(void)
     return ESP_OK;
 }
 
+/* forward decl: 命令执行 / GET 拉命令 (定义在本文件后半段) */
+static void cmd_execute_from_json(const char *p);
+static void cmd_poll_and_execute(void);
+
 esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sensor_err)
 {
     if (!remote_is_connected()) {
@@ -162,15 +166,14 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
 
     int status = esp_http_client_get_status_code(client);
 
-    /* piggyback: 试读响应, 解析 piggyback cmd 字段.
-     * 如果读不到 (esp_http_client 已知 bug), 推送本身已成功, 不报错. */
+    /* piggyback: 试读响应. ESP-IDF v6 的 esp_http_client 对 POST 响应 body
+     * 读取有 bug, 这里只试 3 次 (~60ms) — 失败就靠下面 GET /api/cmd 兜底 */
     char resp_buf[512] = {0};
     if (status == 200) {
         int len = esp_http_client_get_content_length(client);
         int target = (len > 0 && (size_t)len < sizeof(resp_buf)) ? len : (int)sizeof(resp_buf) - 1;
-        /* 重试 + 短暂延迟, 等 mbedTLS 把 body 喂进 esp_http_client 内部 buffer */
         int total = 0;
-        for (int retry = 0; retry < 20 && total < target; retry++) {
+        for (int retry = 0; retry < 3 && total < target; retry++) {
             int read = esp_http_client_read_response(client, resp_buf + total, target - total);
             if (read > 0) {
                 total += read;
@@ -182,7 +185,7 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
         if (total > 0) {
             ESP_LOGI(TAG, "推送成功 + 响应[%d] 字节", total);
         } else {
-            ESP_LOGI(TAG, "推送成功 (响应未读到, ESP-IDF 已知 bug)");
+            ESP_LOGI(TAG, "推送成功 (piggyback 响应未读到, 走 GET 拉命令)");
         }
     } else {
         ESP_LOGE(TAG, "HTTP POST 返回非 200: status=%d", status);
@@ -192,74 +195,179 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
 
     esp_http_client_cleanup(client);
 
-    /* 解析响应里的 cmd 字段 (piggyback) */
+    /* 解析 piggyback cmd (能读到的就走快路径, 读不到就走下面 GET) */
     if (resp_buf[0] != '\0') {
         const char *cmd_p = strstr(resp_buf, "\"cmd\":{");
-        if (cmd_p) {
-            int cmd_id = 0;
-            const char *id_p = strstr(cmd_p, "\"id\":");
-            if (id_p) cmd_id = atoi(id_p + 5);
-
-            char cmd_name[32] = {0};
-            const char *name_p = strstr(cmd_p, "\"name\":\"");
-            if (name_p) {
-                name_p += 8;  /* skip "name":" */
-                int i = 0;
-                while (*name_p && *name_p != '"' && i < (int)sizeof(cmd_name) - 1) {
-                    cmd_name[i++] = *name_p++;
-                }
-            }
-
-            ESP_LOGI(TAG, "收到 piggyback 命令: id=%d name=%s", cmd_id, cmd_name);
-
-            if (cmd_id > 0 && cmd_name[0] != '\0') {
-                /* 执行命令 */
-                if (strcmp(cmd_name, "WATER") == 0) {
-                    int sec = 5;
-                    ESP_LOGI(TAG, "→ 启动水泵 %d 秒", sec);
-                    relay_write(true);
-                    vTaskDelay(pdMS_TO_TICKS((uint32_t)sec * 1000));
-                    relay_write(false);
-                    ESP_LOGI(TAG, "→ 水泵停止");
-                } else if (strcmp(cmd_name, "STOP") == 0) {
-                    relay_write(false);
-                    ESP_LOGI(TAG, "→ 立即停泵");
-                } else if (strcmp(cmd_name, "REBOOT") == 0) {
-                    ESP_LOGW(TAG, "→ 3 秒后重启 ESP32");
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    esp_restart();
-                } else {
-                    ESP_LOGW(TAG, "→ 未知命令: %s", cmd_name);
-                }
-
-                /* ACK 给后端: 把这条命令标 done */
-                char ack_body[128];
-                snprintf(ack_body, sizeof(ack_body),
-                    "{\"key\":\"%s\",\"id\":%d,\"status\":\"done\"}",
-                    DEVICE_API_KEY, cmd_id);
-                /* 单独发一次 ack (失败也无所谓) */
-                esp_http_client_config_t ack_config = {
-                    .url = "https://afl.cn/api/poll_ack",
-                    .method = HTTP_METHOD_POST,
-                    .timeout_ms = 5000,
-                    .transport_type = HTTP_TRANSPORT_OVER_SSL,
-                    .crt_bundle_attach = esp_crt_bundle_attach,
-                };
-                esp_http_client_handle_t ack_client = esp_http_client_init(&ack_config);
-                if (ack_client) {
-                    esp_http_client_set_header(ack_client, "Content-Type", "application/json");
-                    esp_http_client_set_post_field(ack_client, ack_body, strlen(ack_body));
-                    esp_err_t ack_err = esp_http_client_perform(ack_client);
-                    if (ack_err != ESP_OK) {
-                        ESP_LOGE(TAG, "ACK 失败: %s", esp_err_to_name(ack_err));
-                    }
-                    esp_http_client_cleanup(ack_client);
-                }
-            }
+        if (cmd_p && strstr(cmd_p, "\"name\":\"") && !strstr(cmd_p, "\"cmd\":null")) {
+            cmd_execute_from_json(cmd_p);
         }
     }
 
+    /* 主路径: 无论 piggyback 是否成功, 都 GET 一次 /api/cmd.
+     * 没有挂起命令时 GET 是廉价操作, 减少复杂度. */
+    cmd_poll_and_execute();
+
     return ESP_OK;
+}
+
+/* ============================================================
+ *  命令执行: 解析 JSON 中的 cmd 块 + 执行 + ACK
+ *  复用于 piggyback (POST 响应) 和 GET /api/cmd 两条路径
+ * ============================================================ */
+
+static void remote_send_ack(int cmd_id)
+{
+    char ack_body[128];
+    snprintf(ack_body, sizeof(ack_body),
+        "{\"key\":\"%s\",\"id\":%d,\"status\":\"done\"}",
+        DEVICE_API_KEY, cmd_id);
+
+    esp_http_client_config_t ack_config = {
+        .url              = "https://afl.cn/api/poll_ack",
+        .method           = HTTP_METHOD_POST,
+        .timeout_ms       = 5000,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t ack_client = esp_http_client_init(&ack_config);
+    if (!ack_client) {
+        ESP_LOGE(TAG, "ACK 客户端初始化失败");
+        return;
+    }
+    esp_http_client_set_header(ack_client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(ack_client, ack_body, strlen(ack_body));
+    esp_err_t ack_err = esp_http_client_perform(ack_client);
+    if (ack_err != ESP_OK) {
+        ESP_LOGE(TAG, "ACK 失败: %s", esp_err_to_name(ack_err));
+    } else {
+        ESP_LOGI(TAG, "ACK 成功 (id=%d)", cmd_id);
+    }
+    esp_http_client_cleanup(ack_client);
+}
+
+/* 从 cmd 块起始位置解析 id/name/sec, 然后执行.
+ * 接受两种 JSON 形态:
+ *   - piggyback:   "cmd":{"id":1,"name":"WATER","payload":{"sec":5}}
+ *   - GET /api/cmd: 同样的子结构
+ * 这里传入的 p 指向 "cmd":{ 之后的位置或整个响应 body, 都行. */
+static void cmd_execute_from_json(const char *p)
+{
+    if (!p) return;
+
+    int cmd_id = 0;
+    const char *id_p = strstr(p, "\"id\":");
+    if (id_p) cmd_id = atoi(id_p + 5);
+
+    char cmd_name[32] = {0};
+    const char *name_p = strstr(p, "\"name\":\"");
+    if (name_p) {
+        name_p += 8;
+        int i = 0;
+        while (*name_p && *name_p != '"' && i < (int)sizeof(cmd_name) - 1) {
+            cmd_name[i++] = *name_p++;
+        }
+    }
+
+    int sec = 5;  /* 默认 5s, payload.sec 缺失时用此值 */
+    const char *sec_p = strstr(p, "\"sec\":");
+    if (sec_p) {
+        int v = atoi(sec_p + 6);
+        if (v > 0 && v <= 600) sec = v;  /* 限幅 1s..10min */
+    }
+
+    if (cmd_id <= 0 || cmd_name[0] == '\0') {
+        return;  /* 不是命令结构, 忽略 */
+    }
+
+    ESP_LOGI(TAG, "执行命令: id=%d name=%s sec=%d", cmd_id, cmd_name, sec);
+
+    if (strcmp(cmd_name, "WATER") == 0) {
+        ESP_LOGI(TAG, "→ 启动水泵 %d 秒", sec);
+        relay_write(true);
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)sec * 1000));
+        relay_write(false);
+        ESP_LOGI(TAG, "→ 水泵停止");
+    } else if (strcmp(cmd_name, "STOP") == 0) {
+        relay_write(false);
+        ESP_LOGI(TAG, "→ 立即停泵");
+    } else if (strcmp(cmd_name, "REBOOT") == 0) {
+        ESP_LOGW(TAG, "→ 3 秒后重启 ESP32");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+        return;  /* 重启了不 ACK */
+    } else {
+        ESP_LOGW(TAG, "→ 未知命令: %s", cmd_name);
+    }
+
+    remote_send_ack(cmd_id);
+}
+
+/* GET /api/cmd?device_id=X&key=Y — 主动拉取挂起命令 */
+static void cmd_poll_and_execute(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "%s?device_id=%s&key=%s",
+             CMD_POLL_URL, DEVICE_ID, DEVICE_API_KEY);
+
+    esp_http_client_config_t config = {
+        .url              = url,
+        .method           = HTTP_METHOD_GET,
+        .timeout_ms       = HTTP_TIMEOUT_MS,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "GET /api/cmd 客户端初始化失败");
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GET /api/cmd 失败: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return;
+    }
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "GET /api/cmd 返回 status=%d", status);
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    /* GET 响应读取比 POST 可靠, 但仍重试 5 次保稳 */
+    char resp_buf[512] = {0};
+    int len = esp_http_client_get_content_length(client);
+    int target = (len > 0 && (size_t)len < sizeof(resp_buf)) ? len : (int)sizeof(resp_buf) - 1;
+    int total = 0;
+    for (int retry = 0; retry < 5 && total < target; retry++) {
+        int read = esp_http_client_read_response(client, resp_buf + total, target - total);
+        if (read > 0) {
+            total += read;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    resp_buf[total] = '\0';
+    esp_http_client_cleanup(client);
+
+    if (total == 0) {
+        ESP_LOGW(TAG, "GET /api/cmd 响应未读到");
+        return;
+    }
+
+    /* {"ok":true,"cmd":{"id":1,"name":"WATER","payload":{"sec":5}}}
+     * cmd: null 时表示没有挂起命令 */
+    const char *cmd_null = strstr(resp_buf, "\"cmd\":null");
+    if (cmd_null) {
+        ESP_LOGD(TAG, "无挂起命令");
+        return;
+    }
+    const char *cmd_p = strstr(resp_buf, "\"cmd\":{");
+    if (!cmd_p) {
+        return;
+    }
+    cmd_execute_from_json(cmd_p);
 }
 
 bool remote_is_connected(void)
