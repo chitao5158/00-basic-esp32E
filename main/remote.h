@@ -7,6 +7,9 @@
 #include "esp_err.h"
 #include <stdbool.h>
 
+/* 共享给 main.c + remote.c 用的继电器接口 (main.c 定义实现) */
+void relay_write(bool on);
+
 /* ==== 用户配置 (按需修改, 烧一次固件即可生效) ==== */
 /* 这些值在 remote.c 里定义, 修改后重新编译烧录 */
 #define DEVICE_ID        "esp32_jh_01"                        /* 设备唯一 ID */

@@ -96,10 +96,85 @@ app.post('/api/ingest', async (req, res) => {
             [device_id]
         ).catch(() => {});
 
-        console.log(`[ingest] device=${device_id} adc=${adc} pct=${pct} pump=${pump_state} id=${insert_id}`);
-        return res.json({ ok: true, id: insert_id, ts: new Date().toISOString() });
+        // piggyback: 顺便取一条待执行命令 (在数据推送的响应里塞命令)
+        let cmd = null;
+        try {
+            const cmdResult = await pool.query(
+                `SELECT id, cmd, payload FROM commands
+                 WHERE device_id = $1 AND status = 'pending'
+                 ORDER BY id ASC LIMIT 1`,
+                [device_id]
+            );
+            if (cmdResult.rows[0]) {
+                cmd = {
+                    id: Number(cmdResult.rows[0].id),
+                    name: cmdResult.rows[0].cmd,
+                    payload: cmdResult.rows[0].payload ? JSON.parse(cmdResult.rows[0].payload) : null,
+                };
+            }
+        } catch (e) { /* commands 表可能没建, 忽略 */ }
+
+        console.log(`[ingest] device=${device_id} adc=${adc} pct=${pct} pump=${pump_state} id=${insert_id} cmd=${cmd ? cmd.name + '#' + cmd.id : 'none'}`);
+        return res.json({
+            ok: true,
+            id: insert_id,
+            ts: new Date().toISOString(),
+            cmd: cmd,
+        });
     } catch (err) {
         process.stderr.write(`[ingest] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
+/* ---------- POST /api/command (浏览器 -> 后端入队命令) ---------- */
+app.post('/api/command', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const cmd = (req.body && req.body.cmd || '').toString().toUpperCase().trim();
+    const device_id = (req.body && req.body.device_id || 'esp32_jh_01').toString().trim();
+    const payload = req.body && req.body.payload;
+
+    if (!['WATER', 'STOP', 'REBOOT', 'CALIBRATE'].includes(cmd)) {
+        return res.status(400).json({ ok: false, error: 'cmd must be one of: WATER, STOP, REBOOT, CALIBRATE' });
+    }
+
+    try {
+        const r = await pool.query(
+            `INSERT INTO commands (device_id, cmd, payload) VALUES ($1, $2, $3) RETURNING id`,
+            [device_id, cmd, payload ? JSON.stringify(payload) : null]
+        );
+        return res.json({ ok: true, id: r.rows[0].id, cmd, device_id, ts: new Date().toISOString() });
+    } catch (err) {
+        process.stderr.write(`[command] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
+/* ---------- POST /api/poll_ack (ESP32 报告命令执行完成) ---------- */
+app.post('/api/poll_ack', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const id = parseInt(req.body && req.body.id);
+    const status = (req.body && req.body.status || 'done').toString();
+
+    if (!Number.isFinite(id) || id <= 0) {
+        return res.status(400).json({ ok: false, error: 'invalid id' });
+    }
+    if (!['done', 'failed'].includes(status)) {
+        return res.status(400).json({ ok: false, error: 'status must be done or failed' });
+    }
+
+    try {
+        await pool.query(
+            `UPDATE commands SET status = $1, acked_at = NOW() WHERE id = $2`,
+            [status, id]
+        );
+        return res.json({ ok: true });
+    } catch (err) {
+        process.stderr.write(`[poll_ack] DB error: ${err.message}\n`);
         return res.status(500).json({ ok: false, error: 'db error' });
     }
 });

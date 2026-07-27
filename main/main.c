@@ -143,7 +143,8 @@ static void relay_init(void)
 #endif
 }
 
-static void relay_write(bool on)
+/* 非 static: 让 remote.c 能调用执行 web 控制命令 */
+void relay_write(bool on)
 {
 #if RELAY_ACTIVE_LOW
     gpio_set_level(RELAY_GPIO, on ? 0 : 1);
