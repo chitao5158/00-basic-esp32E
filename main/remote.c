@@ -165,46 +165,17 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
     }
 
     int status = esp_http_client_get_status_code(client);
-
-    /* piggyback: 试读响应. ESP-IDF v6 的 esp_http_client 对 POST 响应 body
-     * 读取有 bug, 这里只试 3 次 (~60ms) — 失败就靠下面 GET /api/cmd 兜底 */
-    char resp_buf[512] = {0};
-    if (status == 200) {
-        int len = esp_http_client_get_content_length(client);
-        int target = (len > 0 && (size_t)len < sizeof(resp_buf)) ? len : (int)sizeof(resp_buf) - 1;
-        int total = 0;
-        for (int retry = 0; retry < 3 && total < target; retry++) {
-            int read = esp_http_client_read_response(client, resp_buf + total, target - total);
-            if (read > 0) {
-                total += read;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-        }
-        resp_buf[total] = '\0';
-        if (total > 0) {
-            ESP_LOGI(TAG, "推送成功 + 响应[%d] 字节", total);
-        } else {
-            ESP_LOGI(TAG, "推送成功 (piggyback 响应未读到, 走 GET 拉命令)");
-        }
-    } else {
-        ESP_LOGE(TAG, "HTTP POST 返回非 200: status=%d", status);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
-    }
-
     esp_http_client_cleanup(client);
 
-    /* 解析 piggyback cmd (能读到的就走快路径, 读不到就走下面 GET) */
-    if (resp_buf[0] != '\0') {
-        const char *cmd_p = strstr(resp_buf, "\"cmd\":{");
-        if (cmd_p && strstr(cmd_p, "\"name\":\"") && !strstr(cmd_p, "\"cmd\":null")) {
-            cmd_execute_from_json(cmd_p);
-        }
+    if (status != 200) {
+        ESP_LOGE(TAG, "HTTP POST 返回非 200: status=%d", status);
+        return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "推送成功 (status=200)");
 
-    /* 主路径: 无论 piggyback 是否成功, 都 GET 一次 /api/cmd.
-     * 没有挂起命令时 GET 是廉价操作, 减少复杂度. */
+    /* 不再读 POST 响应 (ESP-IDF v6 bug, GET /api/cmd 才是主路径) */
+
+    /* 主路径: GET /api/cmd 拉取挂起命令 */
     cmd_poll_and_execute();
 
     return ESP_OK;
@@ -302,7 +273,14 @@ static void cmd_execute_from_json(const char *p)
     remote_send_ack(cmd_id);
 }
 
-/* GET /api/cmd?device_id=X&key=Y — 主动拉取挂起命令 */
+/* GET /api/cmd?device_id=X&key=Y — 主动拉取挂起命令
+ *
+ * ESP-IDF v6 esp_http_client_perform() 在 mbedTLS HTTPS 上对响应 body
+ * 读取有已知 bug (perform() 提前返回, body 留在 SSL 缓冲里).
+ *
+ * 绕过方案: 用 streaming 模式 — open() + fetch_headers() + 读循环,
+ * 并加 Connection: close 让 server 关连接触发 mbedTLS flush.
+ */
 static void cmd_poll_and_execute(void)
 {
     char url[256];
@@ -315,46 +293,64 @@ static void cmd_poll_and_execute(void)
         .timeout_ms       = HTTP_TIMEOUT_MS,
         .transport_type   = HTTP_TRANSPORT_OVER_SSL,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size      = 4096,
+        .buffer_size_tx   = 1024,
+        .keep_alive_enable = false,  /* 强制 server 响应后关连接, 触发 mbedTLS flush */
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         ESP_LOGE(TAG, "GET /api/cmd 客户端初始化失败");
         return;
     }
+    esp_http_client_set_header(client, "Connection", "close");
 
-    esp_err_t err = esp_http_client_perform(client);
+    /* streaming 模式: open() 替代 perform(), 拿到 SSL 连接后手动读响应 */
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "GET /api/cmd 失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "GET /api/cmd open 失败: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return;
     }
+
+    /* 等 server 响应头 */
+    int content_length = esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
     if (status != 200) {
         ESP_LOGE(TAG, "GET /api/cmd 返回 status=%d", status);
+        esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return;
     }
+    ESP_LOGI(TAG, "GET /api/cmd status=200 content_length=%d", content_length);
 
-    /* GET 响应读取比 POST 可靠, 但仍重试 5 次保稳 */
+    /* 读响应 body — 流式循环直到拿够或超时 */
     char resp_buf[512] = {0};
-    int len = esp_http_client_get_content_length(client);
-    int target = (len > 0 && (size_t)len < sizeof(resp_buf)) ? len : (int)sizeof(resp_buf) - 1;
     int total = 0;
-    for (int retry = 0; retry < 5 && total < target; retry++) {
+    int target = (content_length > 0 && (size_t)content_length < sizeof(resp_buf))
+                 ? content_length
+                 : (int)sizeof(resp_buf) - 1;
+
+    int retries = 30;  /* 30 × 50ms = 1.5s */
+    while (total < target && retries-- > 0) {
         int read = esp_http_client_read_response(client, resp_buf + total, target - total);
         if (read > 0) {
             total += read;
+        } else if (read == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            ESP_LOGE(TAG, "GET /api/cmd read 错误: %d", read);
+            break;
         }
     }
     resp_buf[total] = '\0';
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (total == 0) {
-        ESP_LOGW(TAG, "GET /api/cmd 响应未读到");
+        ESP_LOGW(TAG, "GET /api/cmd 响应仍读不到 (streaming + close 也失败)");
         return;
     }
+    ESP_LOGI(TAG, "GET /api/cmd 响应[%d] 字节: %s", total, resp_buf);
 
     /* {"ok":true,"cmd":{"id":1,"name":"WATER","payload":{"sec":5}}}
      * cmd: null 时表示没有挂起命令 */
