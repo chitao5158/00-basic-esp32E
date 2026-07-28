@@ -189,6 +189,87 @@ app.get('/api/cmd', async (req, res) => {
     }
 });
 
+/* ---------- GET /api/config (ESP32 拉取阈值 + 推送周期) ----------
+ * 浏览器 PUT 改完后, ESP32 下次 push 时跟 GET /api/cmd 一起拉走.
+ * 表里没配置 → 返回默认值 (服务端逻辑, 不强制要求 seed) */
+app.get('/api/config', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const device_id = (req.query && req.query.device_id || '').toString().trim();
+    if (!device_id || device_id.length > 64) {
+        return res.status(400).json({ ok: false, error: 'invalid device_id' });
+    }
+
+    const DEFAULT_CONFIG = { on_pct: 30, off_pct: 70, push_period_ms: 300000 };
+
+    try {
+        const result = await pool.query(
+            `SELECT on_pct, off_pct, push_period_ms FROM device_config WHERE device_id = $1`,
+            [device_id]
+        );
+        const config = result.rows[0]
+            ? {
+                on_pct:         result.rows[0].on_pct,
+                off_pct:        result.rows[0].off_pct,
+                push_period_ms: result.rows[0].push_period_ms,
+              }
+            : DEFAULT_CONFIG;
+        return res.json({ ok: true, config });
+    } catch (err) {
+        process.stderr.write(`[config] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
+/* ---------- PUT /api/config (浏览器改阈值 / 推送周期) ---------- */
+app.put('/api/config', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const device_id = (req.body && req.body.device_id || 'esp32_jh_01').toString().trim();
+    if (!device_id || device_id.length > 64) {
+        return res.status(400).json({ ok: false, error: 'invalid device_id' });
+    }
+
+    const on_pct         = parseInt(req.body && req.body.on_pct);
+    const off_pct        = parseInt(req.body && req.body.off_pct);
+    const push_period_ms = parseInt(req.body && req.body.push_period_ms);
+
+    /* 校验 — 服务端权威, ESP32 也会再次验证 */
+    if (!Number.isFinite(on_pct) || on_pct < 0 || on_pct > 99) {
+        return res.status(400).json({ ok: false, error: 'on_pct must be 0~99' });
+    }
+    if (!Number.isFinite(off_pct) || off_pct < 1 || off_pct > 100) {
+        return res.status(400).json({ ok: false, error: 'off_pct must be 1~100' });
+    }
+    if (off_pct - on_pct < 5) {
+        return res.status(400).json({ ok: false, error: 'off_pct must be at least 5 > on_pct (dead zone)' });
+    }
+    if (!Number.isFinite(push_period_ms) || push_period_ms < 5000 || push_period_ms > 3600000) {
+        return res.status(400).json({ ok: false, error: 'push_period_ms must be 5000~3600000' });
+    }
+
+    try {
+        await pool.query(
+            `INSERT INTO device_config (device_id, on_pct, off_pct, push_period_ms, updated_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             ON CONFLICT (device_id) DO UPDATE
+             SET on_pct = $2, off_pct = $3, push_period_ms = $4, updated_at = NOW()`,
+            [device_id, on_pct, off_pct, push_period_ms]
+        );
+        console.log(`[config] updated device=${device_id} on=${on_pct} off=${off_pct} period=${push_period_ms}ms`);
+        return res.json({
+            ok: true,
+            config: { device_id, on_pct, off_pct, push_period_ms },
+            ts: new Date().toISOString(),
+        });
+    } catch (err) {
+        process.stderr.write(`[config] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
 /* ---------- POST /api/poll_ack (ESP32 报告命令执行完成) ---------- */
 app.post('/api/poll_ack', async (req, res) => {
     if (!checkApiKey(req)) {

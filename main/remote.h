@@ -15,6 +15,13 @@ void relay_write(bool on);
 #define DEVICE_ID        "esp32_jh_01"                        /* 设备唯一 ID */
 #define INGEST_URL       "https://afl.cn/api/ingest"          /* 后端 POST 地址 (HTTPS, 无 .php) */
 #define CMD_POLL_URL     "https://afl.cn/api/cmd"             /* 后端 GET 地址: 拉取待执行命令 */
+#define CONFIG_URL       "https://afl.cn/api/config"          /* 后端 GET 地址: 拉取阈值 + 推送周期 */
+
+/* ==== 设备阈值/周期 (云端可改, remote.c 拉到后写这里, main.c 读) ==== */
+/* main.c 定义 volatile 全局, remote.c 引用更新 */
+extern volatile int      g_pump_on_pct;
+extern volatile int      g_pump_off_pct;
+extern volatile uint32_t g_push_period_ms;
 
 /* ==== API ==== */
 

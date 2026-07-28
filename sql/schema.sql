@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 CREATE INDEX IF NOT EXISTS idx_cmd_device_status ON commands (device_id, status);
 
+-- 第 4 条: 设备配置 (阈值 + 推送周期, 浏览器改完 ESP32 下次上报时拉走)
+CREATE TABLE IF NOT EXISTS device_config (
+    device_id        VARCHAR(64) PRIMARY KEY,
+    on_pct           INTEGER NOT NULL DEFAULT 30  CHECK (on_pct >= 0 AND on_pct <= 99),
+    off_pct          INTEGER NOT NULL DEFAULT 70  CHECK (off_pct >= 1 AND off_pct <= 100),
+    push_period_ms   INTEGER NOT NULL DEFAULT 300000 CHECK (push_period_ms >= 5000 AND push_period_ms <= 3600000),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 给默认设备播种一份配置 (后续 ON CONFLICT DO NOTHING 重复执行幂等)
+INSERT INTO device_config (device_id, on_pct, off_pct, push_period_ms)
+VALUES ('esp32_jh_01', 30, 70, 300000)
+ON CONFLICT (device_id) DO NOTHING;
+
 -- ==============================================================
 -- 验证用:
 -- SELECT tablename FROM pg_tables WHERE schemaname='public';

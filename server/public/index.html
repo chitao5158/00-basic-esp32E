@@ -109,6 +109,51 @@
         .control-status.ok  { color: #2e7d32; }
         .control-status.err { color: #c62828; }
 
+        /* 配置表单 */
+        .config-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 24px;
+        }
+        .config-card h2 { font-size: 18px; margin-bottom: 12px; }
+        .config-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+            font-size: 14px;
+        }
+        .config-row label {
+            flex: 0 0 120px;
+            color: #555;
+        }
+        .config-row input[type=range] {
+            flex: 1;
+            accent-color: #43a047;
+        }
+        .config-row .value {
+            flex: 0 0 50px;
+            font-weight: 600;
+            color: #1b3a1b;
+            text-align: right;
+        }
+        .config-row select {
+            flex: 1;
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            background: white;
+            font-size: 14px;
+        }
+        .btn-save { background: #43a047; color: white; }
+        .deadzone-note {
+            font-size: 11px;
+            color: #888;
+            margin-top: 8px;
+        }
+
         @media (max-width: 600px) {
             body { padding: 12px; }
             header h1 { font-size: 24px; }
@@ -136,6 +181,35 @@
             <div id="ctrl-status" class="control-status"></div>
             <div style="font-size:11px; opacity:0.6; margin-top:8px;">
                 ⏱ 命令会在 ESP32 下次上报数据时执行 (默认 5 分钟)
+            </div>
+        </div>
+
+        <div class="config-card">
+            <h2>⚙️ 阈值配置</h2>
+            <div class="config-row">
+                <label>启泵阈值:</label>
+                <input type="range" id="on-slider" min="0" max="99" value="30">
+                <span class="value"><span id="on-val">30</span>%</span>
+            </div>
+            <div class="config-row">
+                <label>关泵阈值:</label>
+                <input type="range" id="off-slider" min="1" max="100" value="70">
+                <span class="value"><span id="off-val">70</span>%</span>
+            </div>
+            <div class="config-row">
+                <label>推送周期:</label>
+                <select id="period-select">
+                    <option value="30000">30 秒 (DEBUG)</option>
+                    <option value="60000">1 分钟</option>
+                    <option value="300000" selected>5 分钟 (推荐)</option>
+                    <option value="1800000">30 分钟</option>
+                    <option value="3600000">1 小时 (省电)</option>
+                </select>
+            </div>
+            <button class="btn btn-save" id="save-config" onclick="saveConfig()">💾 保存配置</button>
+            <div id="config-status" class="control-status"></div>
+            <div class="deadzone-note">
+                死区 (off_pct − on_pct) 必须 ≥ 5%, 防止临界值反复跳. ⏱ ESP32 下次上报时应用新配置 (最长一个推送周期).
             </div>
         </div>
 
@@ -171,6 +245,72 @@
                 document.querySelectorAll('.btn').forEach(b => b.disabled = false);
             }
         }
+
+        /* ===== 阈值配置 ===== */
+        const onSlider  = document.getElementById('on-slider');
+        const offSlider = document.getElementById('off-slider');
+        const onVal     = document.getElementById('on-val');
+        const offVal    = document.getElementById('off-val');
+        const periodSel = document.getElementById('period-select');
+
+        function syncSliderDisplays() {
+            onVal.textContent  = onSlider.value;
+            offVal.textContent = offSlider.value;
+        }
+        onSlider.addEventListener('input', syncSliderDisplays);
+        offSlider.addEventListener('input', syncSliderDisplays);
+
+        async function loadConfig() {
+            try {
+                const r = await fetch(`/api/config?device_id=esp32_jh_01&key=${encodeURIComponent(API_KEY)}`, { cache: 'no-store' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const data = await r.json();
+                if (!data.ok) throw new Error(data.error || 'unknown');
+                const c = data.config;
+                onSlider.value  = c.on_pct;
+                offSlider.value = c.off_pct;
+                periodSel.value = String(c.push_period_ms);
+                syncSliderDisplays();
+            } catch (err) {
+                console.warn('loadConfig 失败:', err.message);
+            }
+        }
+
+        async function saveConfig() {
+            const el = document.getElementById('config-status');
+            el.className = 'control-status';
+            el.textContent = '⏳ 保存中...';
+            document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+            const body = {
+                key: API_KEY,
+                device_id: 'esp32_jh_01',
+                on_pct: parseInt(onSlider.value),
+                off_pct: parseInt(offSlider.value),
+                push_period_ms: parseInt(periodSel.value),
+            };
+            try {
+                const r = await fetch('/api/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await r.json();
+                if (!r.ok || !data.ok) throw new Error(data.error || 'HTTP ' + r.status);
+                el.className = 'control-status ok';
+                const min = Math.round(data.config.push_period_ms / 60000);
+                const sec = Math.round(data.config.push_period_ms / 1000);
+                const periodStr = min >= 1 ? `${min} 分钟` : `${sec} 秒`;
+                el.textContent = `✅ 已保存: on<${data.config.on_pct}% off>=${data.config.off_pct}% period=${periodStr}`;
+            } catch (err) {
+                el.className = 'control-status err';
+                el.textContent = `❌ 失败: ${err.message}`;
+            } finally {
+                document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+            }
+        }
+
+        loadConfig();
+        setInterval(loadConfig, 60000);  /* 每分钟刷新一下, 看 ESP32 是否已拉走新值 */
 
         async function fetchData() {
             try {

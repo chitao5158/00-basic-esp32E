@@ -59,11 +59,12 @@ static const char *TAG = "app";
 #define RELAY_GPIO          GPIO_NUM_5
 #define RELAY_ACTIVE_LOW    1
 
-/* ==== 自动浇花阈值 (百分比) ==== */
-#define PUMP_ON_PCT         30      /* 低于此值启泵 */
-#define PUMP_OFF_PCT        70      /* 高于此值关泵 */
-#define SAMPLE_PERIOD_MS    2000    /* 采样周期 */
-#define PUSH_PERIOD_MS      300000  /* 远程推送周期 (5 分钟) */
+/* ==== 自动浇花阈值 (从云端 device_config 拉, 默认值在云端) ==== */
+/* extern volatile 声明见 remote.h; 非 static 让 remote.c 也能更新 */
+volatile int      g_pump_on_pct       = 30;   /* 低于此值启泵 */
+volatile int      g_pump_off_pct      = 70;   /* 高于此值关泵 */
+#define SAMPLE_PERIOD_MS    2000    /* 采样周期 (本地固定) */
+volatile uint32_t g_push_period_ms    = 300000;  /* 远程推送周期 (云端可改) */
 
 /* ==== 安全机制 (防止传感器故障 / 接线松脱导致水泵一直开) ==== */
 #define PUMP_MAX_RUNTIME_MS 60000   /* 水泵最长连续运行 60s 后强制关闭 */
@@ -180,11 +181,11 @@ static void control_pump(int adc, int pct)
     }
     s_sensor_err = false;
 
-    /* 计算期望状态 (hysteresis) */
+    /* 计算期望状态 (hysteresis) — 阈值从云端拉 */
     bool want_on;
-    if (pct < PUMP_ON_PCT) {
+    if (pct < g_pump_on_pct) {
         want_on = true;                /* 太干 -> 开泵 */
-    } else if (pct >= PUMP_OFF_PCT) {
+    } else if (pct >= g_pump_off_pct) {
         want_on = false;               /* 够湿 -> 关泵 */
     } else {
         want_on = s_pump_on;           /* 死区 -> 保持现状 */
@@ -209,7 +210,7 @@ static void control_pump(int adc, int pct)
             s_pump_on_since_ms = now_ms;
         }
         ESP_LOGW(TAG, "Pump %s (pct=%d%%, 阈值 on<%d  off>=%d)",
-                 s_pump_on ? "ON" : "OFF", pct, PUMP_ON_PCT, PUMP_OFF_PCT);
+                 s_pump_on ? "ON" : "OFF", pct, g_pump_on_pct, g_pump_off_pct);
     }
 }
 
@@ -278,11 +279,11 @@ void app_main(void)
     ssd1306_refresh();
 
     ESP_LOGI(TAG, "自动浇花已启动: pct<%d -> 启泵, pct>=%d -> 关泵",
-             PUMP_ON_PCT, PUMP_OFF_PCT);
+             g_pump_on_pct, g_pump_off_pct);
 
     /* 远程推送初始化 (WiFi + HTTP 客户端). 失败也不阻塞本地. */
     remote_init();
-    ESP_LOGI(TAG, "远程推送目标: %s (推送周期 %d ms)", INGEST_URL, PUSH_PERIOD_MS);
+    ESP_LOGI(TAG, "远程推送目标: %s (推送周期 %d ms)", INGEST_URL, g_push_period_ms);
 
     TickType_t last_push_tick = 0;
 
@@ -294,9 +295,9 @@ void app_main(void)
                  adc, pct, s_pump_on ? "ON " : "OFF");
         render(adc, pct);
 
-        /* 周期性推送到云端 (默认 5 分钟一次) */
+        /* 周期性推送到云端 (默认 5 分钟一次, 可被云端配置覆盖) */
         TickType_t now = xTaskGetTickCount();
-        if (now - last_push_tick >= pdMS_TO_TICKS(PUSH_PERIOD_MS)) {
+        if (now - last_push_tick >= pdMS_TO_TICKS(g_push_period_ms)) {
             last_push_tick = now;
             remote_post_reading(adc, pct, s_pump_on ? "ON" : "OFF", s_sensor_err);
         }

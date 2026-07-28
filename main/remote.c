@@ -120,6 +120,7 @@ esp_err_t remote_init(void)
 /* forward decl: 命令执行 / GET 拉命令 (定义在本文件后半段) */
 static void cmd_execute_from_json(const char *p);
 static void cmd_poll_and_execute(void);
+static void config_poll_and_apply(void);
 
 esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sensor_err)
 {
@@ -175,8 +176,9 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
 
     /* 不再读 POST 响应 (ESP-IDF v6 bug, GET /api/cmd 才是主路径) */
 
-    /* 主路径: GET /api/cmd 拉取挂起命令 */
+    /* 主路径: GET /api/cmd 拉取挂起命令 + GET /api/config 拉取阈值/周期 */
     cmd_poll_and_execute();
+    config_poll_and_apply();
 
     return ESP_OK;
 }
@@ -370,4 +372,100 @@ bool remote_is_connected(void)
 {
     if (!s_wifi_event_group) return false;
     return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+}
+
+/* ============================================================
+ *  GET /api/config 拉取设备阈值 + 推送周期
+ *  用 streaming + Connection: close (跟 cmd_poll_and_execute 同模式)
+ * ============================================================ */
+static void config_poll_and_apply(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "%s?device_id=%s&key=%s",
+             CONFIG_URL, DEVICE_ID, DEVICE_API_KEY);
+
+    esp_http_client_config_t config = {
+        .url              = url,
+        .method           = HTTP_METHOD_GET,
+        .timeout_ms       = HTTP_TIMEOUT_MS,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size      = 4096,
+        .buffer_size_tx   = 1024,
+        .keep_alive_enable = false,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "GET /api/config 客户端初始化失败");
+        return;
+    }
+    esp_http_client_set_header(client, "Connection", "close");
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GET /api/config open 失败: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "GET /api/config 返回 status=%d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    char resp_buf[256] = {0};
+    int total = 0;
+    int target = (content_length > 0 && (size_t)content_length < sizeof(resp_buf))
+                 ? content_length
+                 : (int)sizeof(resp_buf) - 1;
+    int retries = 30;
+    while (total < target && retries-- > 0) {
+        int read = esp_http_client_read_response(client, resp_buf + total, target - total);
+        if (read > 0) total += read;
+        else if (read == 0) vTaskDelay(pdMS_TO_TICKS(50));
+        else break;
+    }
+    resp_buf[total] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (total == 0) {
+        ESP_LOGW(TAG, "GET /api/config 响应读不到, 沿用本地阈值");
+        return;
+    }
+
+    /* 响应: {"ok":true,"config":{"on_pct":30,"off_pct":70,"push_period_ms":300000}} */
+    int new_on = -1, new_off = -1;
+    uint32_t new_period = 0;
+
+    const char *p = strstr(resp_buf, "\"on_pct\":");
+    if (p) new_on = atoi(p + 9);
+    p = strstr(resp_buf, "\"off_pct\":");
+    if (p) new_off = atoi(p + 10);
+    p = strstr(resp_buf, "\"push_period_ms\":");
+    if (p) new_period = (uint32_t)atoi(p + 17);
+
+    /* 校验 (服务端已校过, 这里再防一次) */
+    if (new_on < 0 || new_on > 99
+        || new_off < 1 || new_off > 100
+        || new_off - new_on < 5
+        || new_period < 5000 || new_period > 3600000) {
+        ESP_LOGW(TAG, "config 字段越界, 沿用本地: %s", resp_buf);
+        return;
+    }
+
+    /* 检测到变更才打日志, 避免每次都刷屏 */
+    if (new_on != g_pump_on_pct || new_off != g_pump_off_pct || new_period != g_push_period_ms) {
+        ESP_LOGW(TAG, "config 更新: on<%d -> on<%d, off>=%d -> off>=%d, period %ums -> %ums",
+                 g_pump_on_pct, new_on,
+                 g_pump_off_pct, new_off,
+                 (unsigned)g_push_period_ms, (unsigned)new_period);
+        g_pump_on_pct    = new_on;
+        g_pump_off_pct   = new_off;
+        g_push_period_ms = new_period;
+    }
 }
