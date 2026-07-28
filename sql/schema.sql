@@ -56,6 +56,20 @@ INSERT INTO device_config (device_id, on_pct, off_pct, push_period_ms)
 VALUES ('esp32_jh_01', 30, 70, 300000)
 ON CONFLICT (device_id) DO NOTHING;
 
+-- 第 5 条: 浇水审计日志 (ESP32 每次启/停水泵时打点)
+-- start_ts 既是时间也是隐式 id: stop 事件用同一 start_ts 找原行 UPDATE
+CREATE TABLE IF NOT EXISTS pump_events (
+    id          BIGSERIAL PRIMARY KEY,
+    device_id   VARCHAR(64) NOT NULL,
+    start_ts    TIMESTAMPTZ NOT NULL,
+    end_ts      TIMESTAMPTZ,                       -- NULL = 还在跑
+    duration_sec INTEGER,                          -- end_ts - start_ts, NULL until stop
+    trigger     VARCHAR(16) NOT NULL,              -- 'auto' / 'web' / 'manual'
+    start_pct   INTEGER,                          -- 浇前土壤湿度
+    end_pct     INTEGER                           -- 浇后土壤湿度
+);
+CREATE INDEX IF NOT EXISTS idx_pump_events_device_ts ON pump_events (device_id, start_ts DESC);
+
 -- ==============================================================
 -- 验证用:
 -- SELECT tablename FROM pg_tables WHERE schemaname='public';

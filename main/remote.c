@@ -19,6 +19,7 @@
 #include "remote.h"
 
 #include <string.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -256,12 +257,12 @@ static void cmd_execute_from_json(const char *p)
 
     if (strcmp(cmd_name, "WATER") == 0) {
         ESP_LOGI(TAG, "→ 启动水泵 %d 秒", sec);
-        relay_write(true);
+        web_pump_on();
         vTaskDelay(pdMS_TO_TICKS((uint32_t)sec * 1000));
-        relay_write(false);
+        web_pump_off();
         ESP_LOGI(TAG, "→ 水泵停止");
     } else if (strcmp(cmd_name, "STOP") == 0) {
-        relay_write(false);
+        web_pump_off();
         ESP_LOGI(TAG, "→ 立即停泵");
     } else if (strcmp(cmd_name, "REBOOT") == 0) {
         ESP_LOGW(TAG, "→ 3 秒后重启 ESP32");
@@ -468,4 +469,56 @@ static void config_poll_and_apply(void)
         g_pump_off_pct   = new_off;
         g_push_period_ms = new_period;
     }
+}
+
+/* ============================================================
+ *  浇水审计: 启/停水泵时各打一次点
+ *  POST /api/pump_event { event: 'start' | 'stop', start_ts_ms, ... }
+ *  fire-and-forget: 失败仅打日志, 不阻塞 / 不重试
+ * ============================================================ */
+
+/* 共用的小 POST 函数: 给定 url 和 body, 不读响应 (跟 ACK 同样的 fire-and-forget) */
+static void post_json_fire_and_forget(const char *url, const char *body)
+{
+    if (!remote_is_connected()) {
+        return;
+    }
+    esp_http_client_config_t config = {
+        .url              = url,
+        .method           = HTTP_METHOD_POST,
+        .timeout_ms       = 5000,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return;
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "POST %s 失败: %s", url, esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+void remote_pump_event_start(const char *trigger, int start_pct, int64_t start_ts_ms)
+{
+    char body[192];
+    snprintf(body, sizeof(body),
+        "{\"key\":\"%s\",\"device_id\":\"%s\",\"event\":\"start\","
+        "\"trigger\":\"%s\",\"start_pct\":%d,\"start_ts_ms\":%lld}",
+        DEVICE_API_KEY, DEVICE_ID, trigger, start_pct, (long long)start_ts_ms);
+    ESP_LOGI(TAG, "pump event: start trigger=%s pct=%d ts=%lld", trigger, start_pct, (long long)start_ts_ms);
+    post_json_fire_and_forget(PUMP_EVENT_URL, body);
+}
+
+void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_ms)
+{
+    char body[192];
+    snprintf(body, sizeof(body),
+        "{\"key\":\"%s\",\"device_id\":\"%s\",\"event\":\"stop\","
+        "\"end_pct\":%d,\"start_ts_ms\":%lld,\"duration_ms\":%u}",
+        DEVICE_API_KEY, DEVICE_ID, end_pct, (long long)start_ts_ms, (unsigned)duration_ms);
+    ESP_LOGI(TAG, "pump event: stop pct=%d duration=%ums", end_pct, (unsigned)duration_ms);
+    post_json_fire_and_forget(PUMP_EVENT_URL, body);
 }

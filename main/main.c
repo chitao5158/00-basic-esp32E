@@ -74,7 +74,10 @@ volatile uint32_t g_push_period_ms    = 300000;  /* 远程推送周期 (云端�
 static adc_oneshot_unit_handle_t s_adc_handle;
 static bool s_pump_on = false;          /* 当前水泵状态 */
 static bool s_sensor_err = false;       /* 传感器故障状态 */
-static uint32_t s_pump_on_since_ms = 0; /* 水泵启动时刻 (ms) */
+static uint32_t s_pump_on_since_ms = 0; /* 水泵启动时刻 (FreeRTOS ms) */
+static int64_t  s_pump_start_epoch_ms = 0; /* 水泵启动 epoch ms, 用于 pump_events 关联 */
+static char     s_pump_trigger[8] = "";    /* "auto" / "web" */
+static int      s_last_pct = 0;             /* 最近一次土壤湿度 (供 web 路径记录用) */
 
 /* ============================================================
  *  ADC
@@ -173,9 +176,13 @@ static void control_pump(int adc, int pct)
         }
         s_sensor_err = true;
         if (s_pump_on) {
+            const uint32_t dur_ms = now_ms - s_pump_on_since_ms;
+            remote_pump_event_stop(pct, s_pump_start_epoch_ms, dur_ms);
+            s_pump_start_epoch_ms = 0;
+            s_pump_on_since_ms = 0;
             s_pump_on = false;
             relay_write(false);
-            ESP_LOGE(TAG, "传感器故障 -> 水泵强制关闭");
+            ESP_LOGE(TAG, "传感器故障 -> 水泵强制关闭 (持续 %lu ms)", (unsigned long)dur_ms);
         }
         return;
     }
@@ -204,14 +211,60 @@ static void control_pump(int adc, int pct)
 
     /* 应用新状态 */
     if (want_on != s_pump_on) {
-        s_pump_on = want_on;
-        relay_write(s_pump_on);
         if (s_pump_on) {
+            /* 关泵 — 先算时长再改状态 (避免覆盖) */
+            const uint32_t dur_ms = now_ms - s_pump_on_since_ms;
+            s_pump_on = false;
+            relay_write(false);
+            if (s_pump_start_epoch_ms > 0) {
+                remote_pump_event_stop(pct, s_pump_start_epoch_ms, dur_ms);
+            }
+            s_pump_start_epoch_ms = 0;
+            s_pump_on_since_ms = 0;
+            ESP_LOGW(TAG, "Pump OFF (pct=%d%%, 持续 %lu ms)", pct, (unsigned long)dur_ms);
+        } else {
+            /* 启泵 — 用 boot 后累计 ms 当 epoch 占位 (足够区分事件顺序) */
             s_pump_on_since_ms = now_ms;
+            s_pump_start_epoch_ms = (int64_t)now_ms;
+            strncpy(s_pump_trigger, "auto", sizeof(s_pump_trigger));
+            s_pump_on = true;
+            relay_write(true);
+            remote_pump_event_start("auto", pct, s_pump_start_epoch_ms);
+            ESP_LOGW(TAG, "Pump ON (pct=%d%%, 阈值 on<%d  off>=%d)",
+                     pct, g_pump_on_pct, g_pump_off_pct);
         }
-        ESP_LOGW(TAG, "Pump %s (pct=%d%%, 阈值 on<%d  off>=%d)",
-                 s_pump_on ? "ON" : "OFF", pct, g_pump_on_pct, g_pump_off_pct);
     }
+}
+
+/* ============================================================
+ *  Web 路径水泵控制 (remote.c 的 WATER/STOP 命令调用)
+ *  trigger = "web", 状态独立于 hysteresis (但继电器只受一个地方控制)
+ * ============================================================ */
+
+void web_pump_on(void)
+{
+    const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_pump_on_since_ms    = now_ms;
+    s_pump_start_epoch_ms = (int64_t)now_ms;
+    strncpy(s_pump_trigger, "web", sizeof(s_pump_trigger));
+    s_pump_on = true;
+    relay_write(true);
+    remote_pump_event_start("web", s_last_pct, s_pump_start_epoch_ms);
+    ESP_LOGW(TAG, "Pump ON (web 路径, pct=%d%%)", s_last_pct);
+}
+
+void web_pump_off(void)
+{
+    const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    const uint32_t dur_ms = (s_pump_on_since_ms > 0) ? (now_ms - s_pump_on_since_ms) : 0;
+    s_pump_on = false;
+    relay_write(false);
+    if (s_pump_start_epoch_ms > 0) {
+        remote_pump_event_stop(s_last_pct, s_pump_start_epoch_ms, dur_ms);
+    }
+    s_pump_start_epoch_ms = 0;
+    s_pump_on_since_ms = 0;
+    ESP_LOGW(TAG, "Pump OFF (web 路径, 持续 %lu ms)", (unsigned long)dur_ms);
 }
 
 /* ============================================================
@@ -290,6 +343,7 @@ void app_main(void)
     while (true) {
         int adc = soil_adc_read_avg();
         int pct = soil_pct(adc);
+        s_last_pct = pct;          /* 缓存, web 路径用 */
         control_pump(adc, pct);    /* hysteresis + 安全检查 */
         ESP_LOGI(TAG, "soil: adc=%4d  pct=%3d%%  pump=%s",
                  adc, pct, s_pump_on ? "ON " : "OFF");

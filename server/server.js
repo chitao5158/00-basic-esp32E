@@ -297,6 +297,119 @@ app.post('/api/poll_ack', async (req, res) => {
     }
 });
 
+/* ---------- POST /api/pump_event (ESP32 上报水泵启停) ---------- */
+/* body: { event: 'start'|'stop', device_id, trigger?, start_pct?, end_pct?, start_ts_ms?, duration_ms? }
+ * start_ts_ms 是 ESP32 给的 epoch ms (来自本地 tick), 用它做关联 — 这样 stop 不用记 id */
+app.post('/api/pump_event', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const event = (req.body && req.body.event || '').toString();
+    const device_id = (req.body && req.body.device_id || '').toString().trim();
+    if (!['start', 'stop'].includes(event)) {
+        return res.status(400).json({ ok: false, error: 'event must be start or stop' });
+    }
+    if (!device_id || device_id.length > 64) {
+        return res.status(400).json({ ok: false, error: 'invalid device_id' });
+    }
+
+    const start_ts_ms = parseInt(req.body && req.body.start_ts_ms);
+    if (!Number.isFinite(start_ts_ms) || start_ts_ms <= 0) {
+        return res.status(400).json({ ok: false, error: 'invalid start_ts_ms' });
+    }
+
+    try {
+        if (event === 'start') {
+            const trigger   = (req.body && req.body.trigger || 'auto').toString();
+            const start_pct = parseInt(req.body && req.body.start_pct);
+            if (!['auto', 'web', 'manual'].includes(trigger)) {
+                return res.status(400).json({ ok: false, error: 'trigger must be auto|web|manual' });
+            }
+            if (!Number.isFinite(start_pct) || start_pct < 0 || start_pct > 100) {
+                return res.status(400).json({ ok: false, error: 'invalid start_pct (0~100)' });
+            }
+            await pool.query(
+                `INSERT INTO pump_events (device_id, start_ts, trigger, start_pct)
+                 VALUES ($1, to_timestamp($2 / 1000.0), $3, $4)`,
+                [device_id, start_ts_ms, trigger, start_pct]
+            );
+            console.log(`[pump_event] start device=${device_id} trigger=${trigger} pct=${start_pct}`);
+            return res.json({ ok: true, event: 'start', start_ts_ms });
+        } else {
+            /* stop — 用 start_ts_ms 找原行 (前提: ESP32 传来的 start_ts_ms 与 start 时一致) */
+            const end_pct     = parseInt(req.body && req.body.end_pct);
+            const duration_ms = parseInt(req.body && req.body.duration_ms);
+            if (!Number.isFinite(end_pct) || end_pct < 0 || end_pct > 100) {
+                return res.status(400).json({ ok: false, error: 'invalid end_pct (0~100)' });
+            }
+            if (!Number.isFinite(duration_ms) || duration_ms < 0 || duration_ms > 600000) {
+                return res.status(400).json({ ok: false, error: 'invalid duration_ms (0~600000)' });
+            }
+            const duration_sec = Math.round(duration_ms / 1000);
+            const r = await pool.query(
+                `UPDATE pump_events
+                 SET end_ts = NOW(), duration_sec = $1, end_pct = $2
+                 WHERE device_id = $3
+                   AND start_ts = to_timestamp($4 / 1000.0)
+                   AND end_ts IS NULL`,
+                [duration_sec, end_pct, device_id, start_ts_ms]
+            );
+            if (r.rowCount === 0) {
+                /* 没找到 start 行 — 可能是 ESP32 重启后丢上下文. 兜底: 新建一行只填 end. */
+                await pool.query(
+                    `INSERT INTO pump_events (device_id, start_ts, end_ts, duration_sec, trigger, end_pct)
+                     VALUES ($1, to_timestamp($2 / 1000.0), NOW(), $3, 'web', $4)`,
+                    [device_id, start_ts_ms, duration_sec, end_pct]
+                );
+            }
+            console.log(`[pump_event] stop device=${device_id} duration=${duration_ms}ms pct=${end_pct}`);
+            return res.json({ ok: true, event: 'stop', duration_sec });
+        }
+    } catch (err) {
+        process.stderr.write(`[pump_event] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
+/* ---------- GET /api/pump_events (前端浇水历史) ---------- */
+app.get('/api/pump_events', async (req, res) => {
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const device_id = (req.query && req.query.device_id || '').toString().trim();
+    if (!device_id || device_id.length > 64) {
+        return res.status(400).json({ ok: false, error: 'invalid device_id' });
+    }
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+    try {
+        const result = await pool.query(
+            `SELECT id, start_ts, end_ts, duration_sec, trigger, start_pct, end_pct
+             FROM pump_events
+             WHERE device_id = $1
+             ORDER BY start_ts DESC
+             LIMIT $2`,
+            [device_id, limit]
+        );
+        return res.json({
+            ok: true,
+            events: result.rows.map(r => ({
+                id:           Number(r.id),
+                start_ts:     r.start_ts.toISOString(),
+                end_ts:       r.end_ts ? r.end_ts.toISOString() : null,
+                duration_sec: r.duration_sec,
+                trigger:      r.trigger,
+                start_pct:    r.start_pct,
+                end_pct:      r.end_pct,
+                running:      r.end_ts === null,  /* 还在跑 */
+            })),
+        });
+    } catch (err) {
+        process.stderr.write(`[pump_events] DB error: ${err.message}\n`);
+        return res.status(500).json({ ok: false, error: 'db error' });
+    }
+});
+
 /* ---------- GET /api/data ---------- */
 app.get('/api/data', async (req, res) => {
     try {
