@@ -513,7 +513,9 @@ typedef struct {
 
 static QueueHandle_t s_pump_event_queue = NULL;
 
-/* 后台 task: 从队列取事件, 同步 POST (允许 5s timeout). */
+/* 后台 task: 从队列取事件, 用 streaming open/write/close 模式发 POST.
+ * 不读响应 — fire-and-forget. 关键: 不用 perform() (避免 mbedTLS 完整握手 +
+ * 证书验证 + 响应读取, 这些操作会占 mbedTLS 硬件锁 5+ 秒, 触发 task_wdt). */
 static void pump_event_sender_task(void *arg)
 {
     ESP_LOGI(TAG, "pump event sender task 启动");
@@ -529,18 +531,28 @@ static void pump_event_sender_task(void *arg)
         esp_http_client_config_t config = {
             .url              = msg.url,
             .method           = HTTP_METHOD_POST,
-            .timeout_ms       = 5000,
+            .timeout_ms       = 8000,
             .transport_type   = HTTP_TRANSPORT_OVER_SSL,
             .crt_bundle_attach = esp_crt_bundle_attach,
+            .buffer_size      = 1024,
+            .buffer_size_tx   = 1024,
         };
         esp_http_client_handle_t client = esp_http_client_init(&config);
         if (!client) continue;
         esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, msg.body, strlen(msg.body));
-        esp_err_t err = esp_http_client_perform(client);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "POST pump_event 失败: %s", esp_err_to_name(err));
+        const int body_len = (int)strlen(msg.body);
+
+        /* streaming 模式: open (TLS 握手 + 发 headers) + write (body) + close (不读响应) */
+        esp_err_t err = esp_http_client_open(client, body_len);
+        if (err == ESP_OK) {
+            int written = esp_http_client_write(client, msg.body, body_len);
+            if (written != body_len) {
+                ESP_LOGW(TAG, "POST pump_event 写不完整: %d/%d", written, body_len);
+            }
+        } else {
+            ESP_LOGW(TAG, "POST pump_event open 失败: %s", esp_err_to_name(err));
         }
+        esp_http_client_close(client);
         esp_http_client_cleanup(client);
     }
 }
