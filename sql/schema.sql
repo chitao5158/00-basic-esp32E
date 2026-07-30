@@ -15,10 +15,14 @@ CREATE TABLE IF NOT EXISTS soil_readings (
     adc INTEGER NOT NULL,
     pct INTEGER NOT NULL,
     pump_state VARCHAR(8) NOT NULL,
-    sensor_err BOOLEAN NOT NULL DEFAULT FALSE
+    sensor_err BOOLEAN NOT NULL DEFAULT FALSE,
+    fw_version VARCHAR(32)                  -- ESP32 上报时带的固件版本号, OTA 后变化可查
 );
 CREATE INDEX IF NOT EXISTS idx_device_ts ON soil_readings (device_id, ts);
 CREATE INDEX IF NOT EXISTS idx_ts ON soil_readings (ts);
+
+-- 老库兼容: 如果 fw_version 列不存在, 加上 (默认空字符串)
+ALTER TABLE soil_readings ADD COLUMN IF NOT EXISTS fw_version VARCHAR(32);
 
 -- 第 2 条: 设备表 (可选, 多设备时用)
 CREATE TABLE IF NOT EXISTS devices (

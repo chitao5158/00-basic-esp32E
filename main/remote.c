@@ -164,16 +164,18 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
     int n;
     if (events_count > 0) {
         n = snprintf(body, sizeof(body),
-            "{\"key\":\"%s\",\"device_id\":\"%s\",\"adc\":%d,\"pct\":%d,"
-            "\"pump\":\"%s\",\"sensor_err\":%s,"
+            "{\"key\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\","
+            "\"adc\":%d,\"pct\":%d,\"pump\":\"%s\",\"sensor_err\":%s,"
             "\"pump_events\":[%s]}",
-            DEVICE_API_KEY, DEVICE_ID, adc, pct, pump_state,
+            DEVICE_API_KEY, DEVICE_ID, FW_VERSION,
+            adc, pct, pump_state,
             sensor_err ? "true" : "false", events_buf);
     } else {
         n = snprintf(body, sizeof(body),
-            "{\"key\":\"%s\",\"device_id\":\"%s\",\"adc\":%d,\"pct\":%d,"
-            "\"pump\":\"%s\",\"sensor_err\":%s}",
-            DEVICE_API_KEY, DEVICE_ID, adc, pct, pump_state,
+            "{\"key\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\","
+            "\"adc\":%d,\"pct\":%d,\"pump\":\"%s\",\"sensor_err\":%s}",
+            DEVICE_API_KEY, DEVICE_ID, FW_VERSION,
+            adc, pct, pump_state,
             sensor_err ? "true" : "false");
     }
     if (n < 0 || n >= (int)sizeof(body)) {

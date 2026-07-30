@@ -116,13 +116,17 @@ app.post('/api/ingest', async (req, res) => {
 
     try {
         // Postgres 用 $1, $2... 占位符; INSERT...RETURNING id 拿刚插入的 id
+        const fw_version = (req.body && req.body.fw_version || '').toString().slice(0, 32);
         const insertResult = await pool.query(
-            `INSERT INTO soil_readings (device_id, adc, pct, pump_state, sensor_err)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING id`,
-            [device_id, adc, pct, pump_state, sensor_err]
+            `INSERT INTO soil_readings (device_id, adc, pct, pump_state, sensor_err, fw_version)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, fw_version`,
+            [device_id, adc, pct, pump_state, sensor_err, fw_version]
         );
         const insert_id = insertResult.rows[0].id;
+        if (fw_version) {
+            console.log(`[ingest] device=${device_id} fw=${fw_version}`);
+        }
 
         // 顺带更新 devices.last_seen (表可能不存在, 忽略)
         await pool.query(
@@ -501,7 +505,7 @@ app.get('/api/pump_events', async (req, res) => {
 app.get('/api/data', async (req, res) => {
     try {
         const latestResult = await pool.query(
-            `SELECT device_id, ts, adc, pct, pump_state, sensor_err
+            `SELECT device_id, ts, adc, pct, pump_state, sensor_err, fw_version
              FROM soil_readings ORDER BY id DESC LIMIT 1`
         );
         const latest = latestResult.rows[0] || null;
