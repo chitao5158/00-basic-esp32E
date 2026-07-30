@@ -223,9 +223,9 @@ static void control_pump(int adc, int pct)
             s_pump_on_since_ms = 0;
             ESP_LOGW(TAG, "Pump OFF (pct=%d%%, 持续 %lu ms)", pct, (unsigned long)dur_ms);
         } else {
-            /* 启泵 — 用 boot 后累计 ms 当 epoch 占位 (足够区分事件顺序) */
+            /* 启泵 — epoch 来自 SNTP 同步的真实时间 (now_epoch_ms() 返回 0 表示未同步) */
             s_pump_on_since_ms = now_ms;
-            s_pump_start_epoch_ms = (int64_t)now_ms;
+            s_pump_start_epoch_ms = now_epoch_ms();
             strncpy(s_pump_trigger, "auto", sizeof(s_pump_trigger));
             s_pump_on = true;
             relay_write(true);
@@ -245,7 +245,7 @@ void web_pump_on(void)
 {
     const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     s_pump_on_since_ms    = now_ms;
-    s_pump_start_epoch_ms = (int64_t)now_ms;
+    s_pump_start_epoch_ms = now_epoch_ms();   /* SNTP 同步后的真实 epoch ms */
     strncpy(s_pump_trigger, "web", sizeof(s_pump_trigger));
     s_pump_on = true;
     relay_write(true);

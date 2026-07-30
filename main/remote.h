@@ -61,3 +61,9 @@ void remote_pump_event_start(const char *trigger, int start_pct, int64_t start_t
  *        用 start_ts_ms 找到 start 行.
  */
 void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_ms);
+
+/**
+ * @brief 当前 epoch 毫秒. SNTP 同步前返回 0 (调用方应跳过审计日志).
+ *        同步后由 esp_sntp 维护, gettimeofday 持续返回真实时间.
+ */
+int64_t now_epoch_ms(void);

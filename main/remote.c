@@ -20,12 +20,14 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -51,6 +53,14 @@ static const char *TAG = "remote";
 
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t s_wifi_event_group;
+static volatile bool      s_time_synced = false;  /* SNTP 是否同步成功 */
+
+/* SNTP 同步回调: 在 SNTP 任务里跑, 设标志让 main 知道可以打真实时间戳 */
+static void sntp_sync_cb(struct timeval *tv)
+{
+    s_time_synced = true;
+    ESP_LOGI(TAG, "SNTP 同步成功, epoch=%lld", (long long)((int64_t)tv->tv_sec));
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
@@ -114,6 +124,15 @@ esp_err_t remote_init(void)
     if (!(bits & WIFI_CONNECTED_BIT)) {
         ESP_LOGW(TAG, "WiFi 连接超时 (%d ms), 远程推送将不可用, 本地浇水照常工作",
                  WIFI_TIMEOUT_MS);
+    }
+
+    /* 启动 SNTP 同步真实时间 (用于 pump_events 审计日志). 同步失败不阻塞. */
+    if (s_time_synced == false) {
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("cn.pool.ntp.org");
+        cfg.sync_cb = sntp_sync_cb;
+        cfg.wait_for_sync = false;  /* 非阻塞: 等 app_main 后台等 */
+        esp_netif_sntp_init(&cfg);
+        ESP_LOGI(TAG, "SNTP 已启动, 等 cn.pool.ntp.org 同步...");
     }
     return ESP_OK;
 }
@@ -521,4 +540,17 @@ void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_
         DEVICE_API_KEY, DEVICE_ID, end_pct, (long long)start_ts_ms, (unsigned)duration_ms);
     ESP_LOGI(TAG, "pump event: stop pct=%d duration=%ums", end_pct, (unsigned)duration_ms);
     post_json_fire_and_forget(PUMP_EVENT_URL, body);
+}
+
+/* 当前 epoch 毫秒 — SNTP 同步前返回 0, 调用方应跳过审计日志或用 fallback */
+int64_t now_epoch_ms(void)
+{
+    if (!s_time_synced) {
+        return 0;
+    }
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) {
+        return 0;
+    }
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
