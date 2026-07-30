@@ -55,6 +55,9 @@ static const char *TAG = "remote";
 static EventGroupHandle_t s_wifi_event_group;
 static volatile bool      s_time_synced = false;  /* SNTP 是否同步成功 */
 
+/* forward decl: pump_event 队列初始化 (在本文件后半定义, remote_init 里用到) */
+static esp_err_t pump_event_post_init(void);
+
 /* SNTP 同步回调: 在 SNTP 任务里跑, 设标志让 main 知道可以打真实时间戳 */
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -134,6 +137,10 @@ esp_err_t remote_init(void)
         esp_netif_sntp_init(&cfg);
         ESP_LOGI(TAG, "SNTP 已启动, 等 cn.pool.ntp.org 同步...");
     }
+
+    /* 启动后台 pump_event 发送队列 (避免 web_pump_on/off 被 HTTPS POST 阻塞 9s) */
+    pump_event_post_init();
+
     return ESP_OK;
 }
 
@@ -493,31 +500,78 @@ static void config_poll_and_apply(void)
 /* ============================================================
  *  浇水审计: 启/停水泵时各打一次点
  *  POST /api/pump_event { event: 'start' | 'stop', start_ts_ms, ... }
- *  fire-and-forget: 失败仅打日志, 不阻塞 / 不重试
+ *
+ *  ESP-IDF v6 esp_http_client_perform() 对 HTTPS 响应读取有已知 bug, 同步调用
+ *  会阻塞 ~9s. 所以 pump_event 的发送必须走 FreeRTOS 队列 + 后台 task, 让
+ *  web_pump_on/off 立即返回, 保证水泵运行时长等于命令值.
  * ============================================================ */
 
-/* 共用的小 POST 函数: 给定 url 和 body, 不读响应 (跟 ACK 同样的 fire-and-forget) */
-static void post_json_fire_and_forget(const char *url, const char *body)
+typedef struct {
+    char url[128];
+    char body[256];
+} pump_event_msg_t;
+
+static QueueHandle_t s_pump_event_queue = NULL;
+
+/* 后台 task: 从队列取事件, 同步 POST (允许 5s timeout). */
+static void pump_event_sender_task(void *arg)
 {
-    if (!remote_is_connected()) {
+    ESP_LOGI(TAG, "pump event sender task 启动");
+    pump_event_msg_t msg;
+    while (1) {
+        if (xQueueReceive(s_pump_event_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!remote_is_connected()) {
+            ESP_LOGW(TAG, "pump event 丢弃 (WiFi 未连): %.80s", msg.body);
+            continue;
+        }
+        esp_http_client_config_t config = {
+            .url              = msg.url,
+            .method           = HTTP_METHOD_POST,
+            .timeout_ms       = 5000,
+            .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) continue;
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, msg.body, strlen(msg.body));
+        esp_err_t err = esp_http_client_perform(client);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "POST pump_event 失败: %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(client);
+    }
+}
+
+/* 在 remote_init() 末尾调用一次, 启动队列 + task */
+static esp_err_t pump_event_post_init(void)
+{
+    s_pump_event_queue = xQueueCreate(8, sizeof(pump_event_msg_t));
+    if (!s_pump_event_queue) {
+        ESP_LOGE(TAG, "pump event 队列创建失败");
+        return ESP_FAIL;
+    }
+    xTaskCreate(pump_event_sender_task, "pump_evt", 4096, NULL, 3, NULL);
+    return ESP_OK;
+}
+
+/* web_pump_on/off 调这个, 立刻返回不阻塞 */
+static void enqueue_pump_event(const char *url, const char *body)
+{
+    if (!s_pump_event_queue) {
+        ESP_LOGW(TAG, "pump event 队列未初始化, 丢弃");
         return;
     }
-    esp_http_client_config_t config = {
-        .url              = url,
-        .method           = HTTP_METHOD_POST,
-        .timeout_ms       = 5000,
-        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return;
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, body, strlen(body));
-    esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "POST %s 失败: %s", url, esp_err_to_name(err));
+    pump_event_msg_t msg;
+    strncpy(msg.url, url, sizeof(msg.url) - 1);
+    msg.url[sizeof(msg.url) - 1] = '\0';
+    strncpy(msg.body, body, sizeof(msg.body) - 1);
+    msg.body[sizeof(msg.body) - 1] = '\0';
+    if (xQueueSend(s_pump_event_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "pump event 队列满, 丢弃: %.80s", msg.body);
     }
-    esp_http_client_cleanup(client);
 }
 
 void remote_pump_event_start(const char *trigger, int start_pct, int64_t start_ts_ms)
@@ -528,7 +582,7 @@ void remote_pump_event_start(const char *trigger, int start_pct, int64_t start_t
         "\"trigger\":\"%s\",\"start_pct\":%d,\"start_ts_ms\":%lld}",
         DEVICE_API_KEY, DEVICE_ID, trigger, start_pct, (long long)start_ts_ms);
     ESP_LOGI(TAG, "pump event: start trigger=%s pct=%d ts=%lld", trigger, start_pct, (long long)start_ts_ms);
-    post_json_fire_and_forget(PUMP_EVENT_URL, body);
+    enqueue_pump_event(PUMP_EVENT_URL, body);
 }
 
 void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_ms)
@@ -539,7 +593,7 @@ void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_
         "\"end_pct\":%d,\"start_ts_ms\":%lld,\"duration_ms\":%u}",
         DEVICE_API_KEY, DEVICE_ID, end_pct, (long long)start_ts_ms, (unsigned)duration_ms);
     ESP_LOGI(TAG, "pump event: stop pct=%d duration=%ums", end_pct, (unsigned)duration_ms);
-    post_json_fire_and_forget(PUMP_EVENT_URL, body);
+    enqueue_pump_event(PUMP_EVENT_URL, body);
 }
 
 /* 当前 epoch 毫秒 — SNTP 同步前返回 0, 调用方应跳过审计日志或用 fallback */
