@@ -27,6 +27,8 @@ build/
 # ESP-IDF specific build outputs
 *.bin
 *.elf
+# 上面 ignore 了所有 .bin, 但 server/public/firmware/latest.bin 是 OTA 资产, 例外
+!server/public/firmware/*.bin
 *.map
 flasher_args.json # Generated in build directory
 sdkconfig.old
