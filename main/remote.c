@@ -553,7 +553,7 @@ static esp_err_t pump_event_post_init(void)
         ESP_LOGE(TAG, "pump event 队列创建失败");
         return ESP_FAIL;
     }
-    xTaskCreate(pump_event_sender_task, "pump_evt", 4096, NULL, 3, NULL);
+    xTaskCreate(pump_event_sender_task, "pump_evt", 8192, NULL, 3, NULL);
     return ESP_OK;
 }
 
