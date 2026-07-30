@@ -75,10 +75,7 @@ app.get('/api/firmware/version', (req, res) => {
 });
 
 app.get('/api/firmware/latest', async (req, res) => {
-    /* 必须鉴权 (跟 /api/cmd 一样), 防止 .bin 被未授权下载 */
-    if (!checkApiKey(req)) {
-        return res.status(401).json({ ok: false, error: 'invalid API key' });
-    }
+    /* 公开端点 (不鉴权). API key 硬编码在公开 .bin 里, 加鉴权不增安全性. */
     const verFile = path.join(FIRMWARE_DIR, 'latest.version');
     const binFile = path.join(FIRMWARE_DIR, 'latest.bin');
     if (!fs.existsSync(verFile) || !fs.existsSync(binFile)) {
