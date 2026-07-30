@@ -147,6 +147,7 @@ static void config_poll_and_apply(void);
 static int  serialize_pump_events(char *out, size_t out_size);
 static void clear_pump_event_buffer(void);
 extern int  s_pump_evt_count;  /* pump event buffer count (defined further down) */
+extern const char *FW_VERSION;  /* main.c 里定义的固件版本号 */
 
 esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sensor_err)
 {
