@@ -295,3 +295,69 @@ ESP32 通过 WiFi + HTTPS 把读数推到 `afl.cn/plant/`，任何浏览器都�
 | ESP32 串口 `mbedtls_x509_crt_parse returned -0x002C` | 硬编码证书格式问题，改用 mbedTLS bundle |
 | 浏览器 `afl.cn/plant/` 空白 | 检查 Supabase 表是否存在 + `SHOW TABLES` |
 | 推送 5xx | 看 Hostinger Runtime logs 找 `[ingest] DB error` |
+
+---
+
+## OTA 远程升级 (新)
+
+不用插 USB,浏览器点一下就把 ESP32 固件刷上。
+
+### 工作流
+
+```bash
+# 1. 编译新固件
+. /Users/jinqun/.espressif/v6.0.1/esp-idf/export.sh
+idf.py build
+
+# 2. 把 .bin 拷贝到 server/ 并 bump 版本号
+mkdir -p server/public/firmware
+cp build/00-basic.bin server/public/firmware/latest.bin
+echo "1.0.1" > server/public/firmware/latest.version
+
+# 3. bump main.c 里的 FW_VERSION (OTA 检查用)
+sed -i '' 's/FW_VERSION = "1.0.0"/FW_VERSION = "1.0.1"/' main/main.c
+
+# 4. commit + push (Hostinger 自动 redeploy,firmware 文件就上线)
+git add -A
+git commit -m "release: v1.0.1"
+git push
+```
+
+### 用户触发
+
+打开 `afl.cn/plant/`,点 "⬆️ 检查更新":
+
+- 当前 = 云端 → "✅ 已是最新 (1.0.1)"
+- 当前 < 云端 → 入队 OTA_UPDATE 命令 → ESP32 下次 push (≤5min) 时:
+  - 拉 `/api/firmware/latest` → `esp_https_ota` 下载到 ota_1 分区
+  - 重启 → bootloader 从 ota_1 启动 → 30s 内没 crash 就 mark valid
+  - ESP32 跑新固件, OLED 显示新版本号
+
+### 安全机制
+
+- **A/B 双分区**: ota_0 / ota_1 各 1MB,新固件写 ota_1,不覆盖当前在跑的
+- **Bootloader 验证**: 启动新固件后 30s 内不 crash 才 mark valid
+- **自动回滚**: 如果新固件 boot 失败, bootloader 自动切回 ota_0
+- **下载中断**: 网络断了不会写 flash,旧固件继续跑
+
+### ⚠️ 首次迁移
+
+老固件是基于 `factory` 分区编译的。新分区表是 `ota_0` + `ota_1`, **老固件在新分区表上启动会找不到合法分区**。
+
+**第一次**部署 OTA 后,需要 USB 烧录一次:
+
+```bash
+. /Users/jinqun/.espressif/v6.0.1/esp-idf/export.sh
+idf.py -p /dev/cu.wchusbserial-XXXX flash
+```
+
+烧进去的是新分区表 + 新固件(写到 ota_0)。**之后所有更新走 OTA,不再需要 USB**。
+
+### 故障排查
+
+| 现象 | 处理 |
+|---|---|
+| ESP32 串口 `OTA: esp_https_ota_begin 失败` | 看错误码: `ESP_ERR_HTTP_...` 是网络/HTTPS 问题; `ESP_ERR_OTA_...` 是分区/镜像问题 |
+| 新固件刷了但没生效 | 30s 内如果新固件反复 crash,bootloader 自动回 ota_0 — 看串口确认是不是 rollback 了 |
+| 浏览器 "检查更新" 报 "无固件" | 服务端 `public/firmware/latest.bin` 或 `latest.version` 缺失 |
+| OTA 命令一直不入队 | 浏览器按钮只入队命令,实际下载要等下次 push;推送周期可调 30s DEBUG 加速 |
