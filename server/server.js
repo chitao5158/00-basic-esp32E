@@ -62,7 +62,6 @@ function checkApiKey(req) {
  *   - latest.version: 单行文本, 当前最新版本号
  *   - latest.bin:     编译产物 build/00-basic.bin, 重命名拷贝过来 */
 const fs = require('fs');
-const path = require('path');
 const FIRMWARE_DIR = path.join(__dirname, 'public', 'firmware');
 
 app.get('/api/firmware/version', (req, res) => {
