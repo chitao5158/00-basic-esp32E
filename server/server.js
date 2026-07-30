@@ -114,6 +114,59 @@ app.post('/api/ingest', async (req, res) => {
             }
         } catch (e) { process.stderr.write(`[ingest] cmd query: ${e.message}\n`); }
 
+        /* 顺便处理 bundle 在 body 里的 pump_events 数组 (ESP32 本地 buffer
+         * 攒着的水泵启停事件). 每个 event 要么 INSERT start, 要么 UPDATE 配对 stop. */
+        const pump_events = Array.isArray(req.body && req.body.pump_events) ? req.body.pump_events : [];
+        let pump_events_inserted = 0;
+        for (const evt of pump_events) {
+            try {
+                if (evt.event === 'start') {
+                    const trigger = (evt.trigger || 'auto').toString();
+                    const start_pct = parseInt(evt.start_pct);
+                    const start_ts_ms = parseInt(evt.start_ts_ms);
+                    if (Number.isFinite(start_ts_ms) && start_ts_ms > 0
+                        && ['auto','web','manual'].includes(trigger)
+                        && Number.isFinite(start_pct) && start_pct >= 0 && start_pct <= 100) {
+                        await pool.query(
+                            `INSERT INTO pump_events (device_id, start_ts, trigger, start_pct)
+                             VALUES ($1, to_timestamp($2 / 1000.0), $3, $4)`,
+                            [device_id, start_ts_ms, trigger, start_pct]
+                        );
+                        pump_events_inserted++;
+                    }
+                } else if (evt.event === 'stop') {
+                    const end_pct = parseInt(evt.end_pct);
+                    const start_ts_ms = parseInt(evt.start_ts_ms);
+                    const duration_ms = parseInt(evt.duration_ms);
+                    if (Number.isFinite(start_ts_ms) && start_ts_ms > 0
+                        && Number.isFinite(end_pct) && end_pct >= 0 && end_pct <= 100
+                        && Number.isFinite(duration_ms) && duration_ms >= 0 && duration_ms <= 600000) {
+                        const duration_sec = Math.round(duration_ms / 1000);
+                        const r = await pool.query(
+                            `UPDATE pump_events
+                             SET end_ts = NOW(), duration_sec = $1, end_pct = $2
+                             WHERE device_id = $3
+                               AND start_ts = to_timestamp($4 / 1000.0)
+                               AND end_ts IS NULL`,
+                            [duration_sec, end_pct, device_id, start_ts_ms]
+                        );
+                        if (r.rowCount === 0) {
+                            /* 没找到 start 行 (ESP32 重启丢了 start), 兜底新建一行 */
+                            await pool.query(
+                                `INSERT INTO pump_events (device_id, start_ts, end_ts, duration_sec, trigger, end_pct)
+                                 VALUES ($1, to_timestamp($2 / 1000.0), NOW(), $3, 'web', $4)`,
+                                [device_id, start_ts_ms, duration_sec, end_pct]
+                            );
+                        }
+                        pump_events_inserted++;
+                    }
+                }
+            } catch (e) { process.stderr.write(`[ingest] pump_event insert: ${e.message}\n`); }
+        }
+        if (pump_events_inserted > 0) {
+            console.log(`[ingest] pump_events inserted: ${pump_events_inserted}`);
+        }
+
         console.log(`[ingest] device=${device_id} adc=${adc} pct=${pct} pump=${pump_state} id=${insert_id} cmd=${cmd ? cmd.name + '#' + cmd.id : 'none'}`);
         return res.json({
             ok: true,

@@ -55,9 +55,6 @@ static const char *TAG = "remote";
 static EventGroupHandle_t s_wifi_event_group;
 static volatile bool      s_time_synced = false;  /* SNTP 是否同步成功 */
 
-/* forward decl: pump_event 队列初始化 (在本文件后半定义, remote_init 里用到) */
-static esp_err_t pump_event_post_init(void);
-
 /* SNTP 同步回调: 在 SNTP 任务里跑, 设标志让 main 知道可以打真实时间戳 */
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -138,16 +135,16 @@ esp_err_t remote_init(void)
         ESP_LOGI(TAG, "SNTP 已启动, 等 cn.pool.ntp.org 同步...");
     }
 
-    /* 启动后台 pump_event 发送队列 (避免 web_pump_on/off 被 HTTPS POST 阻塞 9s) */
-    pump_event_post_init();
-
     return ESP_OK;
 }
 
-/* forward decl: 命令执行 / GET 拉命令 (定义在本文件后半段) */
+/* forward decl: 命令执行 / GET 拉命令 / pump event 序列化 (定义在本文件后半段) */
 static void cmd_execute_from_json(const char *p);
 static void cmd_poll_and_execute(void);
 static void config_poll_and_apply(void);
+static int  serialize_pump_events(char *out, size_t out_size);
+static void clear_pump_event_buffer(void);
+extern int  s_pump_evt_count;  /* pump event buffer count (defined further down) */
 
 esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sensor_err)
 {
@@ -157,15 +154,32 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
     }
 
     /* 组装 JSON body */
-    char body[256];
-    int n = snprintf(body, sizeof(body),
-        "{\"key\":\"%s\",\"device_id\":\"%s\",\"adc\":%d,\"pct\":%d,"
-        "\"pump\":\"%s\",\"sensor_err\":%s}",
-        DEVICE_API_KEY, DEVICE_ID, adc, pct, pump_state,
-        sensor_err ? "true" : "false");
+    char events_buf[1024] = {0};
+    serialize_pump_events(events_buf, sizeof(events_buf));
+    const int events_count = s_pump_evt_count;  /* 在 clear 之前快照 */
+
+    char body[1024];
+    int n;
+    if (events_count > 0) {
+        n = snprintf(body, sizeof(body),
+            "{\"key\":\"%s\",\"device_id\":\"%s\",\"adc\":%d,\"pct\":%d,"
+            "\"pump\":\"%s\",\"sensor_err\":%s,"
+            "\"pump_events\":[%s]}",
+            DEVICE_API_KEY, DEVICE_ID, adc, pct, pump_state,
+            sensor_err ? "true" : "false", events_buf);
+    } else {
+        n = snprintf(body, sizeof(body),
+            "{\"key\":\"%s\",\"device_id\":\"%s\",\"adc\":%d,\"pct\":%d,"
+            "\"pump\":\"%s\",\"sensor_err\":%s}",
+            DEVICE_API_KEY, DEVICE_ID, adc, pct, pump_state,
+            sensor_err ? "true" : "false");
+    }
     if (n < 0 || n >= (int)sizeof(body)) {
         ESP_LOGE(TAG, "JSON 构造失败");
         return ESP_FAIL;
+    }
+    if (events_count > 0) {
+        ESP_LOGI(TAG, "推送 %d 个 pump events 一起", events_count);
     }
 
     /* HTTPS + 内置 CA bundle 验证 (Let's Encrypt 自动信任) */
@@ -191,6 +205,9 @@ esp_err_t remote_post_reading(int adc, int pct, const char *pump_state, bool sen
         esp_http_client_cleanup(client);
         return err;
     }
+
+    /* 推送成功 — 清空 pump event buffer (失败的话保留等下次重试) */
+    clear_pump_event_buffer();
 
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
@@ -499,113 +516,89 @@ static void config_poll_and_apply(void)
 
 /* ============================================================
  *  浇水审计: 启/停水泵时各打一次点
- *  POST /api/pump_event { event: 'start' | 'stop', start_ts_ms, ... }
  *
- *  ESP-IDF v6 esp_http_client_perform() 对 HTTPS 响应读取有已知 bug, 同步调用
- *  会阻塞 ~9s. 所以 pump_event 的发送必须走 FreeRTOS 队列 + 后台 task, 让
- *  web_pump_on/off 立即返回, 保证水泵运行时长等于命令值.
+ *  事件先存到本地环形 buffer, 等下次 /api/ingest push 时一起发出去.
+ *  避免每次启停都单独做 HTTPS POST (mbedTLS handshake + bignum 锁会卡
+ *  5+ 秒, 触发 task_wdt).
+ *
+ *  事件延迟: 最多一个 push 周期 (默认 5 分钟).
+ *  ESP32 重启会丢失 buffer 中的待发事件 (DB 里就出现"孤儿" start 行).
  * ============================================================ */
 
 typedef struct {
-    char url[128];
-    char body[256];
-} pump_event_msg_t;
+    char     event[8];       /* "start" / "stop" */
+    char     trigger[8];     /* "auto" / "web" — only for start */
+    int      start_pct;      /* only for start */
+    int      end_pct;        /* only for stop */
+    int64_t  start_ts_ms;
+    uint32_t duration_ms;   /* only for stop */
+} pump_evt_t;
 
-static QueueHandle_t s_pump_event_queue = NULL;
-
-/* 后台 task: 从队列取事件, 用 streaming open/write/close 模式发 POST.
- * 不读响应 — fire-and-forget. 关键: 不用 perform() (避免 mbedTLS 完整握手 +
- * 证书验证 + 响应读取, 这些操作会占 mbedTLS 硬件锁 5+ 秒, 触发 task_wdt). */
-static void pump_event_sender_task(void *arg)
-{
-    ESP_LOGI(TAG, "pump event sender task 启动");
-    pump_event_msg_t msg;
-    while (1) {
-        if (xQueueReceive(s_pump_event_queue, &msg, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        if (!remote_is_connected()) {
-            ESP_LOGW(TAG, "pump event 丢弃 (WiFi 未连): %.80s", msg.body);
-            continue;
-        }
-        esp_http_client_config_t config = {
-            .url              = msg.url,
-            .method           = HTTP_METHOD_POST,
-            .timeout_ms       = 8000,
-            .transport_type   = HTTP_TRANSPORT_OVER_SSL,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .buffer_size      = 1024,
-            .buffer_size_tx   = 1024,
-        };
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        if (!client) continue;
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        const int body_len = (int)strlen(msg.body);
-
-        /* streaming 模式: open (TLS 握手 + 发 headers) + write (body) + close (不读响应) */
-        esp_err_t err = esp_http_client_open(client, body_len);
-        if (err == ESP_OK) {
-            int written = esp_http_client_write(client, msg.body, body_len);
-            if (written != body_len) {
-                ESP_LOGW(TAG, "POST pump_event 写不完整: %d/%d", written, body_len);
-            }
-        } else {
-            ESP_LOGW(TAG, "POST pump_event open 失败: %s", esp_err_to_name(err));
-        }
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-    }
-}
-
-/* 在 remote_init() 末尾调用一次, 启动队列 + task */
-static esp_err_t pump_event_post_init(void)
-{
-    s_pump_event_queue = xQueueCreate(8, sizeof(pump_event_msg_t));
-    if (!s_pump_event_queue) {
-        ESP_LOGE(TAG, "pump event 队列创建失败");
-        return ESP_FAIL;
-    }
-    xTaskCreate(pump_event_sender_task, "pump_evt", 8192, NULL, 3, NULL);
-    return ESP_OK;
-}
-
-/* web_pump_on/off 调这个, 立刻返回不阻塞 */
-static void enqueue_pump_event(const char *url, const char *body)
-{
-    if (!s_pump_event_queue) {
-        ESP_LOGW(TAG, "pump event 队列未初始化, 丢弃");
-        return;
-    }
-    pump_event_msg_t msg;
-    strncpy(msg.url, url, sizeof(msg.url) - 1);
-    msg.url[sizeof(msg.url) - 1] = '\0';
-    strncpy(msg.body, body, sizeof(msg.body) - 1);
-    msg.body[sizeof(msg.body) - 1] = '\0';
-    if (xQueueSend(s_pump_event_queue, &msg, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "pump event 队列满, 丢弃: %.80s", msg.body);
-    }
-}
+#define PUMP_EVT_BUFFER_SIZE 16
+static pump_evt_t s_pump_evt_buf[PUMP_EVT_BUFFER_SIZE];
+int s_pump_evt_count = 0;  /* 非 static 让 remote_post_reading 能读 (forward decl 在文件顶部) */
 
 void remote_pump_event_start(const char *trigger, int start_pct, int64_t start_ts_ms)
 {
-    char body[192];
-    snprintf(body, sizeof(body),
-        "{\"key\":\"%s\",\"device_id\":\"%s\",\"event\":\"start\","
-        "\"trigger\":\"%s\",\"start_pct\":%d,\"start_ts_ms\":%lld}",
-        DEVICE_API_KEY, DEVICE_ID, trigger, start_pct, (long long)start_ts_ms);
     ESP_LOGI(TAG, "pump event: start trigger=%s pct=%d ts=%lld", trigger, start_pct, (long long)start_ts_ms);
-    enqueue_pump_event(PUMP_EVENT_URL, body);
+    if (s_pump_evt_count >= PUMP_EVT_BUFFER_SIZE) {
+        ESP_LOGW(TAG, "pump event buffer full, dropping start");
+        return;
+    }
+    pump_evt_t *e = &s_pump_evt_buf[s_pump_evt_count++];
+    strncpy(e->event,   "start", sizeof(e->event));
+    strncpy(e->trigger, trigger, sizeof(e->trigger));
+    e->start_pct   = start_pct;
+    e->end_pct     = 0;
+    e->start_ts_ms = start_ts_ms;
+    e->duration_ms = 0;
 }
 
 void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_ms)
 {
-    char body[192];
-    snprintf(body, sizeof(body),
-        "{\"key\":\"%s\",\"device_id\":\"%s\",\"event\":\"stop\","
-        "\"end_pct\":%d,\"start_ts_ms\":%lld,\"duration_ms\":%u}",
-        DEVICE_API_KEY, DEVICE_ID, end_pct, (long long)start_ts_ms, (unsigned)duration_ms);
     ESP_LOGI(TAG, "pump event: stop pct=%d duration=%ums", end_pct, (unsigned)duration_ms);
-    enqueue_pump_event(PUMP_EVENT_URL, body);
+    if (s_pump_evt_count >= PUMP_EVT_BUFFER_SIZE) {
+        ESP_LOGW(TAG, "pump event buffer full, dropping stop");
+        return;
+    }
+    pump_evt_t *e = &s_pump_evt_buf[s_pump_evt_count++];
+    strncpy(e->event,   "stop", sizeof(e->event));
+    strncpy(e->trigger, "", sizeof(e->trigger));
+    e->start_pct   = 0;
+    e->end_pct     = end_pct;
+    e->start_ts_ms = start_ts_ms;
+    e->duration_ms = duration_ms;
+}
+
+/* 把 buffer 里的事件序列化成 JSON 数组, 写到 out (逗号分隔).
+ * 返回写入字节数. */
+static int serialize_pump_events(char *out, size_t out_size)
+{
+    int written = 0;
+    for (int i = 0; i < s_pump_evt_count; i++) {
+        pump_evt_t *e = &s_pump_evt_buf[i];
+        int n;
+        if (strcmp(e->event, "start") == 0) {
+            n = snprintf(out + written, out_size - written,
+                "%s{\"event\":\"start\",\"trigger\":\"%s\",\"start_pct\":%d,\"start_ts_ms\":%lld}",
+                i == 0 ? "" : ",", e->trigger, e->start_pct, (long long)e->start_ts_ms);
+        } else {
+            n = snprintf(out + written, out_size - written,
+                "%s{\"event\":\"stop\",\"end_pct\":%d,\"start_ts_ms\":%lld,\"duration_ms\":%u}",
+                i == 0 ? "" : ",", e->end_pct, (long long)e->start_ts_ms, (unsigned)e->duration_ms);
+        }
+        if (n < 0 || (size_t)n >= out_size - written) {
+            break;
+        }
+        written += n;
+    }
+    return written;
+}
+
+/* push 成功后调用: 清空 buffer. 失败则保留等下次重试. */
+static void clear_pump_event_buffer(void)
+{
+    s_pump_evt_count = 0;
 }
 
 /* 当前 epoch 毫秒 — SNTP 同步前返回 0, 调用方应跳过审计日志或用 fallback */
