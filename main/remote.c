@@ -31,6 +31,8 @@
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
@@ -307,6 +309,10 @@ static void cmd_execute_from_json(const char *p)
     } else if (strcmp(cmd_name, "STOP") == 0) {
         web_pump_off();
         ESP_LOGI(TAG, "→ 立即停泵");
+    } else if (strcmp(cmd_name, "OTA_UPDATE") == 0) {
+        ESP_LOGW(TAG, "→ 触发 OTA 检查/升级");
+        remote_ota_check_and_apply();
+        /* 如果有升级, esp_restart() 不会再回来; 没升级直接 return */
     } else if (strcmp(cmd_name, "REBOOT") == 0) {
         ESP_LOGW(TAG, "→ 3 秒后重启 ESP32");
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -612,4 +618,156 @@ int64_t now_epoch_ms(void)
         return 0;
     }
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* ============================================================
+ *  OTA 升级 (esp_https_ota)
+ *  流程:
+ *    1. GET /api/firmware/version → 拿云端最新版本字符串
+ *    2. 跟本地 FW_VERSION 比
+ *    3. 有新版: GET /api/firmware/latest → 写 ota_1 分区 → esp_restart
+ *    4. ESP-IDF bootloader 验证新固件, 30s 内不 crash 就 mark valid;
+ *       否则自动 rollback 到 ota_0
+ * ============================================================ */
+
+/* FW_VERSION 在 main.c 里定义, 这里 extern 引用 */
+extern const char *FW_VERSION;
+
+static char *http_get_text_streaming(const char *url, int *out_len)
+{
+    esp_http_client_config_t config = {
+        .url              = url,
+        .method           = HTTP_METHOD_GET,
+        .timeout_ms       = 10000,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size      = 1024,
+        .buffer_size_tx   = 1024,
+        .keep_alive_enable = false,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return NULL;
+    esp_http_client_set_header(client, "Connection", "close");
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GET %s open 失败: %s", url, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    int content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGW(TAG, "GET %s 返回 status=%d (无新版可用?)", url, status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+
+    int target = (content_length > 0) ? content_length : 256;
+    char *buf = malloc(target + 1);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    int total = 0;
+    int retries = 20;
+    while (total < target && retries-- > 0) {
+        int read = esp_http_client_read_response(client, buf + total, target - total);
+        if (read > 0) total += read;
+        else if (read == 0) vTaskDelay(pdMS_TO_TICKS(50));
+        else break;
+    }
+    buf[total] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (out_len) *out_len = total;
+    return buf;
+}
+
+void remote_ota_check_and_apply(void)
+{
+    if (!remote_is_connected()) {
+        ESP_LOGW(TAG, "OTA: WiFi 未连, 跳过");
+        return;
+    }
+
+    /* 1. 查云端版本 */
+    char version_url[256];
+    snprintf(version_url, sizeof(version_url), "%s?current=%s",
+             FW_VERSION_URL, FW_VERSION);
+    int len = 0;
+    char *latest_ver = http_get_text_streaming(version_url, &len);
+    if (!latest_ver) {
+        ESP_LOGE(TAG, "OTA: 查版本失败");
+        return;
+    }
+    /* 去掉末尾空白/换行 */
+    while (len > 0 && (latest_ver[len-1] == '\n' || latest_ver[len-1] == '\r' || latest_ver[len-1] == ' ')) {
+        latest_ver[--len] = '\0';
+    }
+    ESP_LOGI(TAG, "OTA: 当前=%s, 云端=%s", FW_VERSION, latest_ver);
+
+    if (strcmp(latest_ver, FW_VERSION) == 0) {
+        ESP_LOGI(TAG, "OTA: 已是最新, 跳过");
+        free(latest_ver);
+        return;
+    }
+    free(latest_ver);
+
+    /* 2. 下载新固件并刷写 */
+    ESP_LOGW(TAG, "OTA: 开始下载新固件...");
+    esp_http_client_config_t http_cfg = {
+        .url              = FW_DOWNLOAD_URL,
+        .timeout_ms       = 30000,
+        .transport_type   = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .keep_alive_enable = false,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
+    esp_https_ota_handle_t ota = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_https_ota_begin 失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    /* 进度日志 + 不让 task_wdt 触发 */
+    int last_pct = -1;
+    while (1) {
+        err = esp_https_ota_perform(ota);
+        if (err != ESP_OK) break;
+
+        int cur = 0, total_size = 0;
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        if (running) total_size = running->size;
+        cur = esp_https_ota_get_image_len_read(ota);
+
+        int pct = (total_size > 0) ? (cur * 100 / total_size) : 0;
+        if (pct != last_pct && pct % 10 == 0) {
+            ESP_LOGI(TAG, "OTA: 下载进度 %d%% (%d/%d)", pct, cur, total_size);
+            last_pct = pct;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  /* 让其它 task 跑 */
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: 下载失败: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota);
+        return;
+    }
+
+    err = esp_https_ota_finish(ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: finish 失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGW(TAG, "OTA: 刷写完成, 3 秒后重启到新固件");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
 }

@@ -42,6 +42,9 @@
 
 static const char *TAG = "app";
 
+/* 固件版本 — 每次发新版手动 bump, OTA 时云端会比这个值 */
+const char *FW_VERSION = "1.0.0";
+
 /* ==== 土壤湿度传感器 (P33/GPIO33/ADC1_CH5, VCC 用 GPIO18 控制) ==== */
 #define SOIL_ADC_UNIT         ADC_UNIT_1
 #define SOIL_ADC_CHANNEL      ADC_CHANNEL_5
@@ -331,6 +334,7 @@ void app_main(void)
     ssd1306_draw_string(0, 12, "starting...");
     ssd1306_refresh();
 
+    ESP_LOGI(TAG, "固件版本: %s", FW_VERSION);
     ESP_LOGI(TAG, "自动浇花已启动: pct<%d -> 启泵, pct>=%d -> 关泵",
              g_pump_on_pct, g_pump_off_pct);
 

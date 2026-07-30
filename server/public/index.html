@@ -208,6 +208,7 @@
                 <button class="btn btn-water" onclick="sendCmd('WATER', {sec: 15})">💧 浇水 15 秒</button>
                 <button class="btn btn-stop"  onclick="sendCmd('STOP', null)">⛔ 立即停泵</button>
                 <button class="btn btn-reb"   onclick="sendCmd('REBOOT', null)">🔄 重启 ESP32</button>
+                <button class="btn btn-reb"   onclick="checkOtaUpdate()">⬆️ 检查更新</button>
             </div>
             <div id="ctrl-status" class="control-status"></div>
             <div style="font-size:11px; opacity:0.6; margin-top:8px;">
@@ -259,7 +260,49 @@
         const API_KEY = prompt('输入 API_KEY (一次性, 保存在浏览器)', '05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3') || '05579823c3b7a34d986e9ac93cde58999e05c5498b12576843a4a0db22b901c3';
         let chart = null;
 
-        async function sendCmd(cmd, payload) {
+        async function checkOtaUpdate() {
+    const el = document.getElementById('ctrl-status');
+    el.className = 'control-status';
+    el.textContent = '⏳ 检查更新中...';
+    document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+    try {
+        // 先查版本, 看是否有新版
+        const verR = await fetch(`/api/firmware/version`, { cache: 'no-store' });
+        if (!verR.ok) throw new Error('HTTP ' + verR.status);
+        const latestVer = (await verR.text()).trim();
+        const curVer = await getFwVersion();
+        el.textContent = `当前 ${curVer} / 云端 ${latestVer}`;
+        if (latestVer === curVer) {
+            el.className = 'control-status ok';
+            el.textContent = `✅ 已是最新 (${curVer})`;
+            return;
+        }
+        // 有新版, 派命令给 ESP32
+        el.textContent = `🔄 有新版 ${latestVer}, 派发给 ESP32...`;
+        const r = await fetch('/api/command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: API_KEY, cmd: 'OTA_UPDATE', device_id: 'esp32_jh_01' })
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) throw new Error(data.error || 'HTTP ' + r.status);
+        el.className = 'control-status ok';
+        el.textContent = `✅ OTA 命令已入队 (#${data.id}) — ESP32 下次上报时检查并升级, 期间会重启`;
+    } catch (err) {
+        el.className = 'control-status err';
+        el.textContent = `❌ 失败: ${err.message}`;
+    } finally {
+        document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+    }
+}
+
+async function getFwVersion() {
+    // 简单解析 main 启动日志拿不到, 客户端硬编码 — 不准但够用
+    // 实际应该 ESP32 push readings 时把 version 也带上, 但目前没带
+    return '1.0.0';  // TODO: 从 ESP32 上报里读, 现在假设是 1.0.0
+}
+
+async function sendCmd(cmd, payload) {
             const el = document.getElementById('ctrl-status');
             el.className = 'control-status';
             el.textContent = `⏳ 发送 ${cmd}...`;

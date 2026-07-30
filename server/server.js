@@ -57,6 +57,41 @@ function checkApiKey(req) {
         && provided === process.env.API_KEY;
 }
 
+/* ---------- OTA 升级 (GET /api/firmware/*) ---------- */
+/* 文件存在 server/public/firmware/:
+ *   - latest.version: 单行文本, 当前最新版本号
+ *   - latest.bin:     编译产物 build/00-basic.bin, 重命名拷贝过来 */
+const fs = require('fs');
+const path = require('path');
+const FIRMWARE_DIR = path.join(__dirname, 'public', 'firmware');
+
+app.get('/api/firmware/version', (req, res) => {
+    /* 公开端点 (不鉴权) — ESP32 boot 时也能查. 不知道 key 也只能看版本号, 拿不到 .bin. */
+    const verFile = path.join(FIRMWARE_DIR, 'latest.version');
+    if (!fs.existsSync(verFile)) {
+        return res.status(404).json({ ok: false, error: 'no firmware available' });
+    }
+    res.set('Cache-Control', 'no-store');
+    res.type('text/plain').send(fs.readFileSync(verFile, 'utf8').trim());
+});
+
+app.get('/api/firmware/latest', async (req, res) => {
+    /* 必须鉴权 (跟 /api/cmd 一样), 防止 .bin 被未授权下载 */
+    if (!checkApiKey(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid API key' });
+    }
+    const verFile = path.join(FIRMWARE_DIR, 'latest.version');
+    const binFile = path.join(FIRMWARE_DIR, 'latest.bin');
+    if (!fs.existsSync(verFile) || !fs.existsSync(binFile)) {
+        return res.status(404).json({ ok: false, error: 'no firmware available' });
+    }
+    const ver = fs.readFileSync(verFile, 'utf8').trim();
+    res.set('X-Firmware-Version', ver);
+    res.set('Content-Type', 'application/octet-stream');
+    console.log(`[ota] serving firmware version=${ver} to device=${req.query.device_id || 'unknown'}`);
+    fs.createReadStream(binFile).pipe(res);
+});
+
 /* ---------- POST /api/ingest ---------- */
 app.post('/api/ingest', async (req, res) => {
     if (!checkApiKey(req)) {
@@ -189,8 +224,8 @@ app.post('/api/command', async (req, res) => {
     const device_id = (req.body && req.body.device_id || 'esp32_jh_01').toString().trim();
     const payload = req.body && req.body.payload;
 
-    if (!['WATER', 'STOP', 'REBOOT', 'CALIBRATE'].includes(cmd)) {
-        return res.status(400).json({ ok: false, error: 'cmd must be one of: WATER, STOP, REBOOT, CALIBRATE' });
+    if (!['WATER', 'STOP', 'REBOOT', 'CALIBRATE', 'OTA_UPDATE'].includes(cmd)) {
+        return res.status(400).json({ ok: false, error: 'cmd must be one of: WATER, STOP, REBOOT, CALIBRATE, OTA_UPDATE' });
     }
 
     try {

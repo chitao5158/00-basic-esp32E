@@ -17,6 +17,8 @@ void relay_write(bool on);
 #define CMD_POLL_URL     "https://afl.cn/api/cmd"             /* 后端 GET 地址: 拉取待执行命令 */
 #define CONFIG_URL       "https://afl.cn/api/config"          /* 后端 GET 地址: 拉取阈值 + 推送周期 */
 #define PUMP_EVENT_URL   "https://afl.cn/api/pump_event"      /* 后端 POST: 浇水启停审计 */
+#define FW_VERSION_URL   "https://afl.cn/api/firmware/version"/* 后端 GET: 最新固件版本 */
+#define FW_DOWNLOAD_URL  "https://afl.cn/api/firmware/latest" /* 后端 GET: 最新 .bin (OTA) */
 
 /* ==== 设备阈值/周期 (云端可改, remote.c 拉到后写这里, main.c 读) ==== */
 /* main.c 定义 volatile 全局, remote.c 引用更新 */
@@ -67,3 +69,10 @@ void remote_pump_event_stop(int end_pct, int64_t start_ts_ms, uint32_t duration_
  *        同步后由 esp_sntp 维护, gettimeofday 持续返回真实时间.
  */
 int64_t now_epoch_ms(void);
+
+/**
+ * @brief 检查云端是否有新版固件, 有就下载刷写并重启.
+ *        从 cmd_execute_from_json (OTA_UPDATE 命令) 或 app_main 启动时调用.
+ *        无新版 / 已是最新 → 啥也不做, 不重启.
+ */
+void remote_ota_check_and_apply(void);
