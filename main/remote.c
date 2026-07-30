@@ -739,29 +739,45 @@ void remote_ota_check_and_apply(void)
         return;
     }
 
-    /* 进度日志 + 不让 task_wdt 触发 */
-    int last_pct = -1;
+    /* 下载循环.
+     * ESP-IDF v6 语义:
+     *   ESP_OK                       = 一块刚写完, 继续
+     *   ESP_ERR_HTTPS_OTA_IN_PROGRESS = 没数据, 等网络
+     *   其他                         = 真错, 中止
+     * 检测"全部写完": esp_https_ota_get_image_len_read() 不再增加
+     */
+    int last_read = 0;
+    int no_progress_count = 0;
+    int total_written = 0;
     while (1) {
         err = esp_https_ota_perform(ota);
-        if (err != ESP_OK) break;
+        total_written = esp_https_ota_get_image_len_read(ota);
 
-        int cur = 0, total_size = 0;
-        const esp_partition_t *running = esp_ota_get_running_partition();
-        if (running) total_size = running->size;
-        cur = esp_https_ota_get_image_len_read(ota);
-
-        int pct = (total_size > 0) ? (cur * 100 / total_size) : 0;
-        if (pct != last_pct && pct % 10 == 0) {
-            ESP_LOGI(TAG, "OTA: 下载进度 %d%% (%d/%d)", pct, cur, total_size);
-            last_pct = pct;
+        if (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            /* 等网络数据 — 短延时 */
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));  /* 让其它 task 跑 */
-    }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: 下载失败: %s", esp_err_to_name(err));
+            esp_https_ota_abort(ota);
+            return;
+        }
 
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA: 下载失败: %s", esp_err_to_name(err));
-        esp_https_ota_abort(ota);
-        return;
+        /* ESP_OK = 写了一块 */
+        if (total_written != last_read) {
+            no_progress_count = 0;
+            last_read = total_written;
+            ESP_LOGI(TAG, "OTA: 已下载 %d 字节", total_written);
+        } else {
+            /* 没新字节 — 可能是已下载完, 也可能是网络卡 */
+            no_progress_count++;
+            if (no_progress_count >= 5) {
+                ESP_LOGI(TAG, "OTA: 连续 %d 次无新字节, 判定下载完成", no_progress_count);
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     err = esp_https_ota_finish(ota);
