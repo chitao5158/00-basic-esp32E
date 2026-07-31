@@ -1,9 +1,22 @@
 # ESP-WROOM-32E (4MB Flash) partition table
 # 用于 OTA: ota_0 + ota_1 双分区 + otadata (boot 选择, 缺它 OTA finish 失败)
+#
+# 2026-07 扩容: app 槽 1MB -> 1.5MB.
+#   原因: v1.0.9 固件已占 983KB/1024KB (96%), 加 Captive Portal (esp_http_server
+#   + SoftAP + DHCPS + dns_server) 约需 50-60KB, 直接溢出.
+#   空间来源: storage(FAT) 分区从项目开始就从未被任何代码使用, 收回 1MB 给 app.
+#   ⚠️ 改分区表后老固件无法在新表下 boot, 必须 USB 烧录一次 (见 memory
+#      esp-idf-v6-ota-pitfalls 第 7 条). 之后继续走 OTA.
+#
+# 对齐要求: app 类型分区的 Offset 必须 64KB (0x10000) 对齐.
+#   0x10000  / 0x10000 = 0x1   OK
+#   0x190000 / 0x10000 = 0x19  OK
+# 末尾校验: 0x312000 + 0xEE000 = 0x400000 = 4MB  OK
+#
 # Name,     Type, SubType,   Offset,   Size
 nvs,        data, nvs,       0x9000,   0x6000
 phy_init,   data, phy,       0xf000,   0x1000
-ota_0,      app,  ota_0,     0x10000,  0x100000
-ota_1,      app,  ota_1,     0x110000, 0x100000
-otadata,    data, ota,       0x210000, 0x2000
-storage,    data, fat,       0x212000, 0x1ee000
+ota_0,      app,  ota_0,     0x10000,  0x180000
+ota_1,      app,  ota_1,     0x190000, 0x180000
+otadata,    data, ota,       0x310000, 0x2000
+storage,    data, fat,       0x312000, 0xee000
