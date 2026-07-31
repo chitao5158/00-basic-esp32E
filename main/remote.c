@@ -741,43 +741,36 @@ void remote_ota_check_and_apply(void)
 
     /* 下载循环.
      * ESP-IDF v6 语义:
-     *   ESP_OK                       = 一块刚写完, 继续
+     *   ESP_OK                       = 写完一块/全部, 看 is_complete_data_received
      *   ESP_ERR_HTTPS_OTA_IN_PROGRESS = 没数据, 等网络
-     *   其他                         = 真错, 中止
-     * 检测"全部写完": esp_https_ota_get_image_len_read() 不再增加
+     *   ESP_FAIL + Invalid State      = 全部写完后的下次调用 (正常现象, 不是错)
+     *   其他                         = 真错
+     * 用 esp_https_ota_is_complete_data_received() 检测"全部下完".
      */
-    int last_read = 0;
-    int no_progress_count = 0;
-    int total_written = 0;
     while (1) {
         err = esp_https_ota_perform(ota);
-        total_written = esp_https_ota_get_image_len_read(ota);
+        int total_written = esp_https_ota_get_image_len_read(ota);
 
         if (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
-            /* 等网络数据 — 短延时 */
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "OTA: 下载失败: %s", esp_err_to_name(err));
-            esp_https_ota_abort(ota);
-            return;
-        }
 
-        /* ESP_OK = 写了一块 */
-        if (total_written != last_read) {
-            no_progress_count = 0;
-            last_read = total_written;
-            ESP_LOGI(TAG, "OTA: 已下载 %d 字节", total_written);
-        } else {
-            /* 没新字节 — 可能是已下载完, 也可能是网络卡 */
-            no_progress_count++;
-            if (no_progress_count >= 5) {
-                ESP_LOGI(TAG, "OTA: 连续 %d 次无新字节, 判定下载完成", no_progress_count);
+        /* 全部写完后, perform() 会先返回 ESP_OK + is_complete=true,
+         * 下一次调用才返回 ESP_FAIL "Invalid State" (预期, 不是错) */
+        if (err == ESP_OK) {
+            if (esp_https_ota_is_complete_data_received(ota)) {
+                ESP_LOGI(TAG, "OTA: 下载完成 (%d 字节)", total_written);
                 break;
             }
+            ESP_LOGI(TAG, "OTA: 已下载 %d 字节", total_written);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        /* 全部写完之后的 "Invalid State" 调用 — 直接退出 */
+        ESP_LOGI(TAG, "OTA: 全部写完, 退出下载循环 (%d 字节)", total_written);
+        break;
     }
 
     err = esp_https_ota_finish(ota);
