@@ -5,4 +5,5 @@ idf_component_register(SRCS "main.c" "remote.c"
                              esp_http_client mbedtls
                              nvs_flash lwip
                              esp_https_ota bootloader_support
+                             esp_timer
                     PRIV_REQUIRES app_update)
