@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>浇花器 WiFi 配置</title>
+<!--
+  ⚠️ 这个页面必须完全自包含 —— 不能有任何外链 (CDN / 字体 / 图标)。
+  手机连上 PlantSetup-XXXX 这个 AP 时是【没有互联网】的,任何外部资源都会加载失败。
+  所有 CSS / JS 内联在本文件里。
+-->
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",
+       "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+       background:#10241b;color:#e8f5ee;line-height:1.5}
+  .wrap{max-width:420px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+  .sub{font-size:13px;color:#7fae95;margin:0 0 22px}
+  label{display:block;font-size:13px;color:#a8cdb9;margin:16px 0 6px}
+  input{width:100%;padding:12px 14px;font-size:16px;border-radius:10px;
+        border:1px solid #2f5443;background:#0a1912;color:#e8f5ee}
+  input:focus{outline:none;border-color:#4ade80}
+  .row{display:flex;gap:8px}
+  .row input{flex:1}
+  button{font:inherit;font-size:15px;border:0;border-radius:10px;padding:12px 16px;
+         cursor:pointer;font-weight:600}
+  .ghost{background:#1d3a2c;color:#a8cdb9;white-space:nowrap}
+  .primary{width:100%;margin-top:22px;padding:14px;background:#22c55e;color:#04180d;font-size:16px}
+  button:disabled{opacity:.5}
+  #list{margin-top:10px;border-radius:10px;overflow:hidden;border:1px solid #2f5443;display:none}
+  #list div{padding:11px 14px;font-size:14px;cursor:pointer;
+            display:flex;justify-content:space-between;gap:10px;
+            border-bottom:1px solid #1d3a2c}
+  #list div:last-child{border-bottom:0}
+  #list div:active{background:#1d3a2c}
+  .ss{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta{color:#7fae95;font-size:12px;flex-shrink:0}
+  .note{margin-top:18px;font-size:12px;color:#6b9c82;text-align:center}
+  .err{background:#7f1d1d;color:#fecaca;padding:10px 14px;border-radius:8px;
+       font-size:13px;margin-top:14px;display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🌱 浇花器 WiFi 配置</h1>
+  <p class="sub">选择或输入你家的 WiFi,保存后设备会自动重启并连接。</p>
+
+  <form id="f" method="POST" action="/save">
+    <label for="ssid">WiFi 名称 (SSID)</label>
+    <div class="row">
+      <input id="ssid" name="ssid" maxlength="32" required autocapitalize="off"
+             autocorrect="off" spellcheck="false" placeholder="点右侧扫描,或手动输入">
+      <button type="button" class="ghost" id="scan">扫描</button>
+    </div>
+    <div id="list"></div>
+
+    <label for="pass">WiFi 密码</label>
+    <div class="row">
+      <input id="pass" name="pass" type="password" maxlength="64"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="开放网络请留空">
+      <button type="button" class="ghost" id="eye">显示</button>
+    </div>
+
+    <div class="err" id="err"></div>
+    <button type="submit" class="primary" id="go">保存并重启</button>
+  </form>
+
+  <p class="note">保存后设备重启约需 30 秒<br>此热点会自动关闭</p>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+
+  // 密码显示/隐藏
+  $('eye').onclick = function(){
+    var p = $('pass');
+    var show = p.type === 'password';
+    p.type = show ? 'text' : 'password';
+    this.textContent = show ? '隐藏' : '显示';
+  };
+
+  function showErr(msg){
+    var e = $('err');
+    e.textContent = msg;
+    e.style.display = msg ? 'block' : 'none';
+  }
+
+  // 扫描附近 WiFi。设备端返回的是【开机时缓存的扫描结果】,
+  // 因为 AP 开着时再扫描会导致射频切信道、把手机踢下线。
+  $('scan').onclick = function(){
+    var btn = this, list = $('list');
+    btn.disabled = true;
+    btn.textContent = '扫描中';
+    showErr('');
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/scan', true);
+    xhr.timeout = 8000;
+
+    xhr.onload = function(){
+      btn.disabled = false;
+      btn.textContent = '扫描';
+      var aps;
+      try { aps = JSON.parse(xhr.responseText); }
+      catch(e){ showErr('扫描结果解析失败'); return; }
+
+      list.innerHTML = '';
+      if(!aps.length){ showErr('没扫到任何 WiFi,请手动输入名称'); return; }
+
+      aps.forEach(function(ap){
+        var row  = document.createElement('div');
+        var name = document.createElement('span');
+        var meta = document.createElement('span');
+        name.className = 'ss';
+        name.textContent = ap.ssid;              // textContent 而非 innerHTML, 防 XSS
+        meta.className = 'meta';
+        meta.textContent = (ap.auth ? '🔒 ' : '') + ap.rssi + ' dBm';
+        row.appendChild(name);
+        row.appendChild(meta);
+        row.onclick = function(){
+          $('ssid').value = ap.ssid;
+          list.style.display = 'none';
+          $('pass').focus();
+        };
+        list.appendChild(row);
+      });
+      list.style.display = 'block';
+    };
+
+    xhr.onerror = xhr.ontimeout = function(){
+      btn.disabled = false;
+      btn.textContent = '扫描';
+      showErr('扫描请求失败,请重试');
+    };
+
+    xhr.send();
+  };
+
+  // 提交前本地校验一次, 省一次往返
+  $('f').onsubmit = function(){
+    var ssid = $('ssid').value.trim();
+    if(!ssid){ showErr('请填写 WiFi 名称'); return false; }
+    $('go').disabled = true;
+    $('go').textContent = '保存中...';
+    return true;
+  };
+})();
+</script>
+</body>
+</html>

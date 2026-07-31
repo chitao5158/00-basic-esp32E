@@ -33,9 +33,28 @@ void web_pump_off(void);
 /* ==== API ==== */
 
 /**
- * @brief 初始化 WiFi (STA 模式), 阻塞直到连接成功或超时 30s.
- *        WiFi 连接失败时不返回 ESP_FAIL, 而是返回 ESP_OK 但日志警告.
- *        这样本地浇水逻辑不依赖网络.
+ * @brief 初始化网络栈: NVS + netif (STA & AP) + event loop + esp_wifi_init.
+ *        只做一次初始化, 重复调用直接返回 ESP_OK.
+ *        不发起连接 —— 连接是 remote_sta_connect() 的事.
+ */
+esp_err_t remote_netif_init(void);
+
+/**
+ * @brief 以 STA 模式连接 WiFi, 阻塞直到成功或超时 30s.
+ *
+ *        凭据优先级: NVS 里配网门户保存的 > remote.c 里硬编码的回退值.
+ *        超时后会停止后台自动重连 (把射频让给配网 AP).
+ *
+ * @return ESP_OK 已连上; ESP_ERR_TIMEOUT 超时未连上
+ */
+esp_err_t remote_sta_connect(void);
+
+/**
+ * @brief 初始化 WiFi 并连接 (= remote_netif_init + remote_sta_connect + SNTP).
+ *
+ *        ⚠️ 返回值语义已变更: 现在会返回 ESP_ERR_TIMEOUT 表示没连上,
+ *        调用方 (app_main) 据此决定是否启动配网门户.
+ *        无论返回什么, 本地浇水逻辑都不受影响.
  */
 esp_err_t remote_init(void);
 
