@@ -5,6 +5,6 @@ idf_component_register(SRCS "main.c" "remote.c" "wifi_prov.c"
                              esp_http_client esp_http_server mbedtls
                              nvs_flash lwip
                              esp_https_ota bootloader_support
-                             dns_server
+                             dns_server esp_timer
                     PRIV_REQUIRES app_update esp_hw_support
                     EMBED_TXTFILES "portal.html")

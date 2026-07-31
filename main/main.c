@@ -44,7 +44,7 @@
 static const char *TAG = "app";
 
 /* 固件版本 — 每次发新版手动 bump, OTA 时云端会比这个值 */
-const char *FW_VERSION = "1.0.9";
+const char *FW_VERSION = "1.0.15";
 
 /* ==== 土壤湿度传感器 (P33/GPIO33/ADC1_CH5, VCC 用 GPIO18 控制) ==== */
 #define SOIL_ADC_UNIT         ADC_UNIT_1
@@ -57,7 +57,8 @@ const char *FW_VERSION = "1.0.9";
 /* 标定值: 在「空气中」和「水中」实测后改写 */
 /* 实测: 空气 adc=4095, 水中 adc=1612 */
 #define SOIL_ADC_DRY        4095
-#define SOIL_ADC_WET        1612
+/* 实测校准: 泡水 = 2600, 离开水 = 4095. 旧的 1612 是未实测时的理论值. */
+#define SOIL_ADC_WET        2600
 
 /* ==== 继电器 (P5/GPIO5, 低电平触发) ==== */
 #define RELAY_GPIO          GPIO_NUM_5
