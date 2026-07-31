@@ -805,6 +805,18 @@ void remote_ota_check_and_apply(void)
         return;
     }
 
+    /* 必须显式 mark valid, 否则 30s 后 bootloader 自动回滚到 ota_0.
+     * esp_https_ota_finish() 在 v6.0.1 里已经会 mark boot 分区 + 写 otadata,
+     * 但不会取消 PENDING_VERIFY 状态 — 那要 app 起来后 30s 内调这个才行. */
+    err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: mark valid 失败: %s", esp_err_to_name(err));
+        /* 不 return: finish 已经成功, 重启后 bootloader 会自己处理.
+         * 但下次会回滚, 用户需要再次 OTA. */
+    } else {
+        ESP_LOGW(TAG, "OTA: mark valid 成功, 重启后将永久 boot 新固件");
+    }
+
     ESP_LOGW(TAG, "OTA: 刷写完成, 3 秒后重启到新固件");
     vTaskDelay(pdMS_TO_TICKS(3000));
     esp_restart();
