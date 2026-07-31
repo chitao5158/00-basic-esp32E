@@ -1,8 +1,9 @@
 # ESP-WROOM-32E (4MB Flash) partition table
-# 用于 OTA: factory → ota_0 + ota_1 双分区, 新固件写 ota_1, 下次启动从 ota_1 boot
+# 用于 OTA: ota_0 + ota_1 双分区 + otadata (boot 选择, 缺它 OTA finish 失败)
 # Name,     Type, SubType,   Offset,   Size
 nvs,        data, nvs,       0x9000,   0x6000
 phy_init,   data, phy,       0xf000,   0x1000
 ota_0,      app,  ota_0,     0x10000,  0x100000
 ota_1,      app,  ota_1,     0x110000, 0x100000
-storage,    data, fat,       0x210000, 0x1f0000
+otadata,    data, ota,       0x210000, 0x2000
+storage,    data, fat,       0x212000, 0x1ee000
