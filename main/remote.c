@@ -752,12 +752,13 @@ void remote_ota_check_and_apply(void)
         return;
     }
 
-    /* 下载循环 (4 层检测完成):
+    /* 下载循环 (4 层检测完成 + retry):
      *   1. esp_https_ota_is_complete_data_received() == true (HTTP 客户端视角)
      *   2. bytes_written 连续 N 次不再增加 (进度停滞)
      *   3. perform() 返回非 OK / 非 IN_PROGRESS (兜底, 退出下载循环)
-     *   4. Content-Length sanity: total_written >= expected_size - 容忍 (新加)
-     *   5. 绝对超时 watchdog: esp_timer 5min 后强制 abort (新加, 修 mbedTLS 大文件死锁)
+     *   4. Content-Length sanity: total_written >= expected_size - 容忍
+     *   5. 绝对超时 watchdog: esp_timer 5min 后强制 esp_restart (mbedTLS 死锁兜底)
+     *   6. retry: ESP_FAIL + total_written > 0 时重试 3 次 (网络抖动兜底)
      * ESP-IDF v6 状态机:
      *   ESP_OK + 还有数据 = 一块刚写完, 继续
      *   ESP_OK + 数据读完 = 全部下完, state → SUCCESS
@@ -766,87 +767,122 @@ void remote_ota_check_and_apply(void)
      *   其他 ESP_FAIL = 真错, abort
      */
 
-    /* 期望大小: 从 Content-Length 拿. 拿不到就 -1 跳过 sanity (旧 fallback 行为). */
-    int expected_size = esp_https_ota_get_image_size(ota);
-    if (expected_size > 0) {
-        ESP_LOGI(TAG, "OTA: 期望固件大小 %d 字节", expected_size);
-    } else {
-        ESP_LOGW(TAG, "OTA: 拿不到 Content-Length, 跳过字节数 sanity");
-    }
+    /* retry 整个 begin+perform+finish 流程. ESP_FAIL 可能是网络抖动
+     * (server 端 bignum 锁, errno 104 Connection reset), 1-2 秒后重试就好. */
+    const int MAX_OTA_ATTEMPTS = 3;
+    bool download_ok = false;
 
-    /* 绝对超时 watchdog: ESP-IDF v6.0.1 + mbedTLS 大文件下载会卡死 perform(),
-     * 主 task 全程阻塞, 看门狗 (WDT) 也不救. esp_https_ota_abort 救不了 — 它只改 state,
-     * 阻塞在 mbedtls_ssl_read 里的 perform 仍然等 socket. 唯一能解除死锁的是 esp_restart:
-     *   - 5 分钟内正常完成 (881KB, 实测 30s 内), watchdog 不触发
-     *   - mbedTLS 死锁时, 5 分钟后强制 esp_restart, bootloader 检测 ota_1 不完整 → 自动回滚
-     */
-    esp_timer_handle_t watchdog;
-    esp_timer_create_args_t wd_args = {
-        .name = "ota_watchdog",
-        .callback = ota_watchdog_cb,  /* 定义在文件前部, 5min 后强制 esp_restart */
-    };
-    esp_timer_create(&wd_args, &watchdog);
-    esp_timer_start_once(watchdog, 5 * 60 * 1000 * 1000ULL);
-
-    int last_written = 0;
-    int no_progress_count = 0;
-    while (1) {
-        err = esp_https_ota_perform(ota);
-        int total_written = esp_https_ota_get_image_len_read(ota);
-
-        /* 第 4 层: 字节数 sanity. 拿到 Content-Length 时, 已下载字节 + 容忍 >= 期望大小就 break.
-         * 这是 mbedTLS 死锁时的救命稻草 — perform 还能 return, 走完这段 sanity 就能 break. */
-        if (expected_size > 0 && total_written + 32 >= expected_size) {
-            ESP_LOGI(TAG, "OTA: 完成 (字节数 sanity: %d / %d 字节)",
-                     total_written, expected_size);
-            esp_timer_stop(watchdog);
-            break;
+    for (int attempt = 1; attempt <= MAX_OTA_ATTEMPTS && !download_ok; attempt++) {
+        if (attempt > 1) {
+            ESP_LOGW(TAG, "OTA: 重试第 %d/%d 次 (上次 perform 失败)",
+                     attempt, MAX_OTA_ATTEMPTS);
+            vTaskDelay(pdMS_TO_TICKS(2000));  /* 等 2s 让网络/bignum 锁恢复 */
+            esp_https_ota_abort(ota);          /* 释放 ota handle, 才能重新 begin */
+            err = esp_https_ota_begin(&ota_cfg, &ota);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "OTA: 重试 begin 失败: %s", esp_err_to_name(err));
+                return;
+            }
+        } else {
+            ESP_LOGI(TAG, "OTA: 第 1/%d 次尝试", MAX_OTA_ATTEMPTS);
         }
 
-        if (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
+        /* 期望大小: 从 Content-Length 拿. 拿不到就 -1 跳过 sanity (旧 fallback 行为). */
+        int expected_size = esp_https_ota_get_image_size(ota);
+        if (expected_size > 0) {
+            ESP_LOGI(TAG, "OTA: 期望固件大小 %d 字节", expected_size);
+        } else {
+            ESP_LOGW(TAG, "OTA: 拿不到 Content-Length, 跳过字节数 sanity");
         }
 
-        if (err == ESP_OK) {
-            /* 第 1 层: HTTP 客户端说下完了 */
-            if (esp_https_ota_is_complete_data_received(ota)) {
-                ESP_LOGI(TAG, "OTA: 完成 (HTTP 客户端报告, %d 字节)", total_written);
+        /* 绝对超时 watchdog: ESP-IDF v6.0.1 + mbedTLS 大文件下载会卡死 perform(),
+         * 主 task 全程阻塞, 看门狗 (WDT) 也不救. esp_https_ota_abort 救不了 — 它只改 state,
+         * 阻塞在 mbedtls_ssl_read 里的 perform 仍然等 socket. 唯一能解除死锁的是 esp_restart:
+         *   - 5 分钟内正常完成 (881KB, 实测 30s 内), watchdog 不触发
+         *   - mbedTLS 死锁时, 5 分钟后强制 esp_restart, bootloader 检测 ota_1 不完整 → 自动回滚
+         */
+        esp_timer_handle_t watchdog;
+        esp_timer_create_args_t wd_args = {
+            .name = "ota_watchdog",
+            .callback = ota_watchdog_cb,  /* 定义在文件前部, 5min 后强制 esp_restart */
+        };
+        esp_timer_create(&wd_args, &watchdog);
+        esp_timer_start_once(watchdog, 5 * 60 * 1000 * 1000ULL);
+
+        int last_written = 0;
+        int no_progress_count = 0;
+        bool break_perform_loop = false;
+
+        while (!break_perform_loop) {
+            err = esp_https_ota_perform(ota);
+            int total_written = esp_https_ota_get_image_len_read(ota);
+
+            /* 第 4 层: 字节数 sanity. 拿到 Content-Length 时, 已下载字节 + 容忍 >= 期望大小就 break.
+             * 这是 mbedTLS 死锁时的救命稻草 — perform 还能 return, 走完这段 sanity 就能 break. */
+            if (expected_size > 0 && total_written + 32 >= expected_size) {
+                ESP_LOGI(TAG, "OTA: 完成 (字节数 sanity: %d / %d 字节)",
+                         total_written, expected_size);
                 esp_timer_stop(watchdog);
+                download_ok = true;
                 break;
             }
-            /* 第 2 层: 进度停滞也算完成 */
-            if (total_written == last_written) {
-                no_progress_count++;
-                if (no_progress_count >= 5) {
-                    ESP_LOGI(TAG, "OTA: 完成 (进度停滞 %d 次, %d 字节)",
-                             no_progress_count, total_written);
+
+            if (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
+            if (err == ESP_OK) {
+                /* 第 1 层: HTTP 客户端说下完了 */
+                if (esp_https_ota_is_complete_data_received(ota)) {
+                    ESP_LOGI(TAG, "OTA: 完成 (HTTP 客户端报告, %d 字节)", total_written);
                     esp_timer_stop(watchdog);
+                    download_ok = true;
                     break;
                 }
-            } else {
-                no_progress_count = 0;
-                last_written = total_written;
-                if (total_written % (50 * 1024) < 1024) {  /* 每 ~50KB 打一次 */
-                    ESP_LOGI(TAG, "OTA: 已下载 %d 字节", total_written);
+                /* 第 2 层: 进度停滞也算完成 */
+                if (total_written == last_written) {
+                    no_progress_count++;
+                    if (no_progress_count >= 5) {
+                        ESP_LOGI(TAG, "OTA: 完成 (进度停滞 %d 次, %d 字节)",
+                                 no_progress_count, total_written);
+                        esp_timer_stop(watchdog);
+                        download_ok = true;
+                        break;
+                    }
+                } else {
+                    no_progress_count = 0;
+                    last_written = total_written;
+                    if (total_written % (50 * 1024) < 1024) {  /* 每 ~50KB 打一次 */
+                        ESP_LOGI(TAG, "OTA: 已下载 %d 字节", total_written);
+                    }
                 }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
             }
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
 
-        /* ESP_FAIL 等其他情况 — 第 3 层兜底.
-         * 大概率是 watchdog timer 触发的 abort (mbedTLS 死锁) 或 SUCCESS 之后的 "Invalid State".
-         * 只对 "下载量 > 0" 的情况当完成. 真正的下载错 (网络断) 会让 total_written 卡住,
-         * finish() 会失败, 不会误启动新固件. */
-        if (total_written > 0 && no_progress_count >= 2) {
-            ESP_LOGI(TAG, "OTA: 完成 (perform 返回 %s 但已有 %d 字节, 尝试 finish)",
+            /* ESP_FAIL 等其他情况 — 第 3 层兜底.
+             * 大概率是 watchdog timer 触发的 abort (mbedTLS 死锁) 或 SUCCESS 之后的 "Invalid State".
+             * 只对 "下载量 > 0" 的情况当完成. 真正的下载错 (网络断) 会让 total_written 卡住,
+             * finish() 会失败, 不会误启动新固件. */
+            if (total_written > 0 && no_progress_count >= 2) {
+                ESP_LOGI(TAG, "OTA: 完成 (perform 返回 %s 但已有 %d 字节, 尝试 finish)",
+                         esp_err_to_name(err), total_written);
+                esp_timer_stop(watchdog);
+                download_ok = true;
+                break;
+            }
+            /* 网络断 / errno 104: 不放弃整个 OTA, 让外层 retry 走.
+             * esp_https_ota_abort 在这里调用, 让 ota handle 释放, 下次 attempt 才能 begin. */
+            ESP_LOGW(TAG, "OTA: perform 返回 %s (已下载 %d 字节), 让外层 retry",
                      esp_err_to_name(err), total_written);
             esp_timer_stop(watchdog);
-            break;
+            break_perform_loop = true;  /* 跳出 perform loop, 但保留 ota handle 给外层 abort */
         }
-        ESP_LOGE(TAG, "OTA: 下载失败: %s (已下载 %d 字节)", esp_err_to_name(err), total_written);
-        esp_timer_stop(watchdog);
+    }
+
+    if (!download_ok) {
+        ESP_LOGE(TAG, "OTA: 重试 %d 次都失败, 放弃", MAX_OTA_ATTEMPTS);
         esp_https_ota_abort(ota);
         return;
     }
