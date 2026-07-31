@@ -43,7 +43,7 @@
 static const char *TAG = "app";
 
 /* 固件版本 — 每次发新版手动 bump, OTA 时云端会比这个值 */
-const char *FW_VERSION = "1.0.9";
+const char *FW_VERSION = "1.0.10";
 
 /* ==== 土壤湿度传感器 (P33/GPIO33/ADC1_CH5, VCC 用 GPIO18 控制) ==== */
 #define SOIL_ADC_UNIT         ADC_UNIT_1
