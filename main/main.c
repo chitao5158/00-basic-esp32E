@@ -39,11 +39,12 @@
 
 #include "ssd1306.h"
 #include "remote.h"
+#include "wifi_prov.h"
 
 static const char *TAG = "app";
 
 /* 固件版本 — 每次发新版手动 bump, OTA 时云端会比这个值 */
-const char *FW_VERSION = "1.0.14";
+const char *FW_VERSION = "1.0.15";
 
 /* ==== 土壤湿度传感器 (P33/GPIO33/ADC1_CH5, VCC 用 GPIO18 控制) ==== */
 #define SOIL_ADC_UNIT         ADC_UNIT_1
@@ -290,6 +291,25 @@ static void render(int adc, int pct)
         return;
     }
 
+    /* 配网模式界面: 让用户不接串口也知道该连哪个热点、去哪个地址 */
+    if (wifi_prov_is_active()) {
+        const char *ap = wifi_prov_ap_ssid();
+        char line_pass[24];
+        char line_soil[24];
+        snprintf(line_pass, sizeof(line_pass), "pw:%s", WIFI_PROV_AP_PASS);
+        /* 底行仍然显示湿度: 提醒用户浇水功能没有停 */
+        snprintf(line_soil, sizeof(line_soil), "%s soil:%d%%",
+                 WIFI_PROV_AP_IP, pct);
+
+        ssd1306_clear();
+        ssd1306_draw_string(0,  0, "WiFi Setup Mode");
+        ssd1306_draw_string(0,  8, ap ? ap : "PlantSetup-????");
+        ssd1306_draw_string(0, 16, line_pass);
+        ssd1306_draw_string(0, 24, line_soil);
+        ssd1306_refresh();
+        return;
+    }
+
     char line_pct[24];
     char line_bar[24];
     char line_pump[24];
@@ -339,9 +359,20 @@ void app_main(void)
     ESP_LOGI(TAG, "自动浇花已启动: pct<%d -> 启泵, pct>=%d -> 关泵",
              g_pump_on_pct, g_pump_off_pct);
 
-    /* 远程推送初始化 (WiFi + HTTP 客户端). 失败也不阻塞本地. */
-    remote_init();
-    ESP_LOGI(TAG, "远程推送目标: %s (推送周期 %d ms)", INGEST_URL, g_push_period_ms);
+    /* 远程推送初始化 (WiFi + HTTP 客户端). 失败也不阻塞本地.
+     * 返回非 ESP_OK 有两种情况: STA 连接超时, 或 NVS 里有 force_ap 标志. */
+    esp_err_t net_err = remote_init();
+
+    /* WiFi 不可用 -> 开配网门户.
+     * 门户在后台跑 (httpd + dns 各自的 task), 下面的浇水循环照常运行。 */
+    if (net_err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 不可用, 启动配网门户");
+        /* 必须在切 AP 之前扫描: AP 起来后扫描会跳信道踢掉手机 */
+        wifi_prov_cache_scan();
+        wifi_prov_start_portal();
+    } else {
+        ESP_LOGI(TAG, "远程推送目标: %s (推送周期 %d ms)", INGEST_URL, g_push_period_ms);
+    }
 
     TickType_t last_push_tick = 0;
 
@@ -354,9 +385,11 @@ void app_main(void)
                  adc, pct, s_pump_on ? "ON " : "OFF");
         render(adc, pct);
 
-        /* 周期性推送到云端 (默认 5 分钟一次, 可被云端配置覆盖) */
+        /* 周期性推送到云端 (默认 5 分钟一次, 可被云端配置覆盖).
+         * 配网模式下没有上行网络, 跳过推送. */
         TickType_t now = xTaskGetTickCount();
-        if (now - last_push_tick >= pdMS_TO_TICKS(g_push_period_ms)) {
+        if (!wifi_prov_is_active() &&
+            now - last_push_tick >= pdMS_TO_TICKS(g_push_period_ms)) {
             last_push_tick = now;
             remote_post_reading(adc, pct, s_pump_on ? "ON" : "OFF", s_sensor_err);
         }

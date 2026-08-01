@@ -27,14 +27,29 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 
 # --- TLS: 内置 CA bundle (验证 Let's Encrypt 证书签发 afl.cn) ---
 # CMN (common) 子集已包含 Let's Encrypt ISRG Root X1, 足够验证 afl.cn,
+<<<<<<< HEAD
+# 比 FULL 省约 30KB flash. 若哪天换了小众 CA 的证书导致握手失败, 改回 FULL.
+=======
 # 比 FULL 省约 30KB flash.
+>>>>>>> origin/main
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 
 # --- 编译优化: -Os 而非默认的 -Og ---
+<<<<<<< HEAD
+# 固件曾达 983KB/1024KB. 加 Captive Portal 前必须换 size 优化腾空间.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# --- lwIP socket 数 ---
+# Captive Portal 同时要跑: httpd (max_open_sockets + 3 个内部保留)
+# + DNS 服务器 UDP + DHCPS + STA. 默认 10 个不够.
+# Espressif 官方 captive_portal example 同样把这个值调到 16.
+CONFIG_LWIP_MAX_SOCKETS=16
+=======
 # 默认 -Og 让 1.0.9 固件 983KB/1024KB (96%), 几乎撑爆 ota 槽.
 # 改 -Os 降到 ~860KB, 给后续功能留空间.
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+>>>>>>> origin/main
 
 # --- Main task 栈: app_main 里要初始化 WiFi + 跑带 printf/I2C 的循环 ---
 # ESP-IDF v6 默认 16384, 之前继承到了 3584 导致 stack overflow

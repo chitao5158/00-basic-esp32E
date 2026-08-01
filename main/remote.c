@@ -17,6 +17,7 @@
  */
 
 #include "remote.h"
+#include "wifi_prov.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -41,6 +42,10 @@ static const char *TAG = "remote";
 
 /* ============================================================
  *  USER CONFIG — 填你自己的值, 然后重新编译烧录
+ *
+ *  ⚠️ 这两个值现在只是【回退默认值】。
+ *     优先级: NVS 里保存的凭据 (通过配网门户写入) > 这里的硬编码。
+ *     NVS 为空时 (例如刚 USB 烧完新固件) 才用下面的值。
  * ============================================================ */
 #define WIFI_SSID         "MERCURY_19F9"          /* ← 你的 WiFi 名字 */
 #define WIFI_PASS         "abc@1234567"           /* ← 你的 WiFi 密码 */
@@ -52,11 +57,21 @@ static const char *TAG = "remote";
 /* HTTP POST 超时 (ms) */
 #define HTTP_TIMEOUT_MS   10000
 
+/* STA 首次连接时最多重试几次, 超过就放弃并交给配网门户。
+ * ⚠️ 这个上限【只作用于开机首次连接】。一旦成功连上过, 就恢复无限重连 ——
+ *    否则路由器重启 (通常 30-60s) 会在几秒内耗光重试次数, 设备将永久离线
+ *    直到手动断电, 这对无人值守的浇花器是不可接受的回归。 */
+#define STA_MAX_RETRY     5
+
 /* ============================================================ */
 
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t s_wifi_event_group;
-static volatile bool      s_time_synced = false;  /* SNTP 是否同步成功 */
+static volatile bool      s_time_synced    = false;  /* SNTP 是否同步成功 */
+static volatile bool      s_sta_give_up    = false;  /* 放弃 STA: 停止自动重连 */
+static volatile bool      s_ever_connected = false;  /* 本次启动是否成功连上过 */
+static volatile int       s_sta_retry      = 0;      /* 首次连接已重试次数 */
+static bool               s_netif_ready    = false;  /* netif/event/wifi 是否已初始化 */
 
 /* SNTP 同步回调: 在 SNTP 任务里跑, 设标志让 main 知道可以打真实时间戳 */
 static void sntp_sync_cb(struct timeval *tv)
@@ -81,21 +96,51 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        /* force_ap 路径下只启动射频用于扫描/开 AP, 不去连接 */
+        if (!s_sta_give_up) {
+            esp_wifi_connect();
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi 断开, 自动重连...");
-        esp_wifi_connect();
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        /* 进了配网门户就不能再重连了: SoftAP 和 STA 共用射频必须同信道,
+         * STA 反复重连会让 AP 跟着跳信道, 把连在配置页上的手机踢下线。 */
+        if (s_sta_give_up) {
+            return;
+        }
+
+        /* 已经成功连上过 -> 无限重连 (保持改造前的行为)。
+         * 路由器重启、临时断网都必须能自愈, 不能因为重试次数用完就永久离线。 */
+        if (s_ever_connected) {
+            ESP_LOGW(TAG, "WiFi 断开, 自动重连...");
+            esp_wifi_connect();
+            return;
+        }
+
+        /* 开机首次连接: 重试有上限, 用完就让 app_main 去开配网门户 */
+        if (++s_sta_retry > STA_MAX_RETRY) {
+            ESP_LOGW(TAG, "WiFi 首次连接重试 %d 次仍失败, 转配网模式", STA_MAX_RETRY);
+            s_sta_give_up = true;
+            return;
+        }
+        ESP_LOGW(TAG, "WiFi 连接失败, 重试 (%d/%d)...", s_sta_retry, STA_MAX_RETRY);
+        esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi 已连接, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_ever_connected = true;   /* 从此断线走无限重连路径 */
+        s_sta_retry      = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-esp_err_t remote_init(void)
+esp_err_t remote_netif_init(void)
 {
-    /* NVS (WiFi 驱动需要) */
+    if (s_netif_ready) {
+        return ESP_OK;
+    }
+
+    /* NVS (WiFi 驱动需要, 配网凭据也存这里) */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -110,7 +155,12 @@ esp_err_t remote_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* STA 和 AP 两个 netif 都提前建好:
+     *   - AP netif 必须存在, dns_server 才能按 "WIFI_AP_DEF" 取到 IP
+     *   - 提前建好可以避免后面切 APSTA 模式时的初始化顺序问题 */
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -120,9 +170,30 @@ esp_err_t remote_init(void)
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                          &wifi_event_handler, NULL, NULL);
 
+    s_netif_ready = true;
+    return ESP_OK;
+}
+
+esp_err_t remote_sta_connect(void)
+{
+    char ssid[WIFI_PROV_SSID_MAX + 1];
+    char pass[WIFI_PROV_PASS_MAX + 1];
+
+    /* 凭据优先级: NVS (配网门户写的) > 硬编码回退值 */
+    if (wifi_prov_load_creds(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK) {
+        ESP_LOGI(TAG, "使用 NVS 中保存的 WiFi 凭据");
+    } else {
+        ESP_LOGI(TAG, "NVS 无凭据, 回退到固件内置的默认 WiFi");
+        snprintf(ssid, sizeof(ssid), "%s", WIFI_SSID);
+        snprintf(pass, sizeof(pass), "%s", WIFI_PASS);
+    }
+
+    s_sta_give_up = false;
+    s_sta_retry   = 0;
+
     wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid,     WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
+    strncpy((char *)wifi_config.sta.ssid,     ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
@@ -130,19 +201,42 @@ esp_err_t remote_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "正在连接 WiFi: %s ...", WIFI_SSID);
+    ESP_LOGI(TAG, "正在连接 WiFi: %s ...", ssid);
 
     /* 阻塞等待连接 (最多 30s) */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                                             pdFALSE, pdTRUE,
                                             pdMS_TO_TICKS(WIFI_TIMEOUT_MS));
     if (!(bits & WIFI_CONNECTED_BIT)) {
-        ESP_LOGW(TAG, "WiFi 连接超时 (%d ms), 远程推送将不可用, 本地浇水照常工作",
-                 WIFI_TIMEOUT_MS);
+        ESP_LOGW(TAG, "WiFi 连接超时 (%d ms), 本地浇水照常工作", WIFI_TIMEOUT_MS);
+        s_sta_give_up = true;   /* 停掉后台重连, 把射频让给配网 AP */
+        return ESP_ERR_TIMEOUT;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t remote_init(void)
+{
+    esp_err_t err = remote_netif_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* 强制配网标志必须在【尝试连接之前】检查。
+     * 否则 STA 先连上了某个信道, 再开 AP 会造成信道冲突 (共用射频), 手机连不稳。 */
+    if (wifi_prov_force_ap_requested()) {
+        ESP_LOGW(TAG, "NVS force_ap=1, 跳过 STA 连接, 直接进配网门户");
+        s_sta_give_up = true;   /* 阻止 STA_START 回调里的 esp_wifi_connect() */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());   /* 射频要起来, 否则没法扫描/开 AP */
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t sta_err = remote_sta_connect();
+
     /* 启动 SNTP 同步真实时间 (用于 pump_events 审计日志). 同步失败不阻塞. */
-    if (s_time_synced == false) {
+    if (sta_err == ESP_OK && s_time_synced == false) {
         esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("cn.pool.ntp.org");
         cfg.sync_cb = sntp_sync_cb;
         cfg.wait_for_sync = false;  /* 非阻塞: 等 app_main 后台等 */
@@ -150,7 +244,9 @@ esp_err_t remote_init(void)
         ESP_LOGI(TAG, "SNTP 已启动, 等 cn.pool.ntp.org 同步...");
     }
 
-    return ESP_OK;
+    /* 返回 STA 结果, 由 app_main 决定是否进配网门户。
+     * 注意: 无论成败, 本地浇水都照常 —— 这是项目的核心约束。 */
+    return sta_err;
 }
 
 /* forward decl: 命令执行 / GET 拉命令 / pump event 序列化 (定义在本文件后半段) */
